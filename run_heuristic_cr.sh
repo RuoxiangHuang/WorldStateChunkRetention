@@ -1,0 +1,1 @@
+lingbot-world/scripts/run_heuristic_cr.sh
