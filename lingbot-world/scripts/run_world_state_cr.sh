@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# World-State CR (default future-use selector, selector_ws_future_v1.pt) @ example01.
+# World-State CR v3 (future-use selector + consolidation + SWTP) @ example01.
 source "$(dirname "$0")/_common.sh"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}" \

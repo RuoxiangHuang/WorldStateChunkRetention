@@ -5,7 +5,7 @@
 # unlike Ulysses sequence-parallel which pays all-to-all comm per layer).
 #
 # Usage:  bash bench/run_dp.sh [N_GPUS] [METHODS] [extra batch_generate args...]
-#   bash bench/run_dp.sh 8 baseline,MoSaiC
+#   bash bench/run_dp.sh 8 window,world_state_cr
 #   bash bench/run_dp.sh 1 baseline --limit 2          # single-worker memory test
 set -uo pipefail
 source /root/miniconda3/etc/profile.d/conda.sh
@@ -13,7 +13,7 @@ conda activate lingbot
 cd /DATA/YuanZhen/Lingbot/lingbot-world
 
 N=${1:-8}
-METHODS=${2:-baseline,MoSaiC}
+METHODS=${2:-window,world_state_cr}
 shift 2 2>/dev/null || true
 RV=bench/realcamvid
 mkdir -p "$RV/logs"

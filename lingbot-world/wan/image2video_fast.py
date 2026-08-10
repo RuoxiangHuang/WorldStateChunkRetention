@@ -68,6 +68,7 @@ class WanI2VFast:
         swtp_keep_ratio=0.5,
         swtp_num_summary=64,
         swtp_min_saliency_gini=0.20,
+        swtp_energy_cover=0.9,
         archive_diversity_pool=0,
         selector="learned",
         selector_ckpt=None,
@@ -78,6 +79,15 @@ class WanI2VFast:
         oracle_future_horizon=8,
         oracle_future_gamma=0.9,
         oracle_future_alpha=0.5,
+        # Memory Consolidation (World-State CR lifecycle; not WorldKV retrieval).
+        consolidation="off",
+        consol_beta=0.7,
+        consol_patience=2,
+        consol_stabilize_thr=0.6,
+        consol_gist_tokens=64,
+        consol_gist_budget=512,
+        consol_rank_alpha=0.5,
+        consol_l2_bottom_ratio=0.5,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -130,7 +140,22 @@ class WanI2VFast:
         self.swtp_keep_ratio = swtp_keep_ratio
         self.swtp_num_summary = swtp_num_summary
         self.swtp_min_saliency_gini = swtp_min_saliency_gini
+        self.swtp_energy_cover = float(swtp_energy_cover)
         self.archive_diversity_pool = int(archive_diversity_pool)
+        from .utils.memory_consolidation import ConsolidationConfig
+        self.consolidation = ConsolidationConfig(
+            mode=str(consolidation or "off").lower(),
+            beta=float(consol_beta),
+            patience=int(consol_patience),
+            stabilize_thr=float(consol_stabilize_thr),
+            gist_tokens=int(consol_gist_tokens),
+            gist_budget_tokens=int(consol_gist_budget),
+            rank_alpha=float(consol_rank_alpha),
+            l2_bottom_ratio=float(consol_l2_bottom_ratio),
+            swtp_keep_ratio=float(swtp_keep_ratio),
+            swtp_num_summary=int(swtp_num_summary),
+            swtp_energy_cover=float(swtp_energy_cover),
+        )
 
         # ── Chunk selector (Learned / World-State CR) ───────────────────────
         # selector='learned' => ChunkSelector MLP archive ranking.
@@ -241,7 +266,7 @@ class WanI2VFast:
         else:
             self.sp_size = 1
 
-        if os.environ.get("MOSAIC_COMPILE", "0") == "1":
+        if os.environ.get("WSCR_COMPILE", os.environ.get("MOSAIC_COMPILE", "0")) == "1":
             # Opt-in (CUDA opt ①): torch.compile each DiT block. The attention call graph-breaks
             # (dynamic KV size + custom flash kernel), so only the token-shape-invariant compute
             # (QKVO/FFN/modulation/cam-MLP, all on the fixed-size current chunk) is compiled.
@@ -254,9 +279,9 @@ class WanI2VFast:
                 if blocks is not None:
                     for i in range(len(blocks)):
                         blocks[i] = torch.compile(blocks[i], dynamic=False)
-                    logging.info(f"MOSAIC_COMPILE: torch.compile applied to {len(blocks)} DiT blocks")
+                    logging.info(f"WSCR_COMPILE: torch.compile applied to {len(blocks)} DiT blocks")
             except Exception as e:  # noqa: BLE001
-                logging.warning(f"MOSAIC_COMPILE failed, running eager: {e}")
+                logging.warning(f"WSCR_COMPILE failed, running eager: {e}")
 
         self.sample_neg_prompt = config.sample_neg_prompt
         self.debug_motion_adaptive_kv = os.environ.get("LINGBOT_DEBUG_MA_KV", "0") == "1"
@@ -267,17 +292,27 @@ class WanI2VFast:
             )
 
         if self.enable_swtp:
-            mode = ("MoSaiC (World-State CR + SWTP)"
+            mode = ("World-State CR + SWTP"
                     if self.enable_motion_adaptive_kv_eviction else "SWTP standalone")
             logging.info(
                 f"{mode} is ENABLED. "
                 f"keep_ratio={self.swtp_keep_ratio}  "
                 f"num_summary={self.swtp_num_summary}  "
-                f"min_gini={self.swtp_min_saliency_gini}. "
-                f"In MoSaiC mode, SWTP is applied only when a chunk transitions into the archive tier; "
-                f"sink and recent chunks remain uncompressed. "
-                f"Each archive chunk's K/V will be reduced from 4680 to ~{int(4680 * self.swtp_keep_ratio + self.swtp_num_summary)} tokens "
-                f"(skipped if saliency Gini < {self.swtp_min_saliency_gini})."
+                f"energy_cover={self.swtp_energy_cover}  "
+                f"min_gini={self.swtp_min_saliency_gini} (below → uniform lattice, not skip). "
+                f"Summary tokens use spatial-cell pooling + norm compensation. "
+                f"With SWTP enabled, is applied only when a chunk transitions into the archive tier; "
+                f"sink and recent chunks remain uncompressed."
+            )
+        if self.consolidation.enabled:
+            logging.info(
+                f"Memory Consolidation ENABLED mode={self.consolidation.mode} "
+                f"beta={self.consolidation.beta} patience={self.consolidation.patience} "
+                f"rank_alpha={self.consolidation.rank_alpha} "
+                f"l2_bottom_ratio={self.consolidation.l2_bottom_ratio} "
+                f"gist_tokens={self.consolidation.gist_tokens} "
+                f"gist_budget={self.consolidation.gist_budget_tokens}. "
+                f"(In-cache lifecycle; not WorldKV bank retrieval.)"
             )
 
         if self.archive_diversity_pool > 0 and self.enable_motion_adaptive_kv_eviction:
@@ -394,84 +429,36 @@ class WanI2VFast:
             x0_previous: [C, F, H, W] same shape, OR None for first chunk
 
         Returns:
-            saliency: [num_tokens] 1D tensor on CPU (size = F * (H/2) * (W/2))
-                      OR None if no previous chunk available
+            (saliency, token_grid) where saliency is [F*Ht*Wt] on CPU and
+            token_grid is (F, Ht, Wt). Or (None, None) if no previous chunk.
         """
         if x0_previous is None:
-            return None
+            return None, None
         diff = (x0_current.float() - x0_previous.float()).abs().mean(dim=0)  # [F, H, W]
         F, H, W = diff.shape
         # Spatial 2x2 pooling → token grid
         H_p, W_p = H // 2, W // 2
         diff = diff[:, :H_p * 2, :W_p * 2].view(F, H_p, 2, W_p, 2).mean(dim=(2, 4))
-        return diff.flatten().cpu()
+        return diff.flatten().cpu(), (int(F), int(H_p), int(W_p))
 
     @torch.no_grad()
     def _gini_coefficient(self, x):
-        """Compute Gini coefficient of a 1D tensor (0 = uniform, 1 = concentrated)."""
-        x = x.flatten().float()
-        if x.numel() < 2 or x.sum().item() < 1e-12:
-            return 0.0
-        sorted_x = torch.sort(x).values
-        n = sorted_x.numel()
-        cum = torch.cumsum(sorted_x, dim=0) / sorted_x.sum()
-        return float(1.0 - 2.0 * cum.sum().item() / n + 1.0 / n)
+        from .utils.swtp import gini_coefficient
+        return gini_coefficient(x)
 
     @torch.no_grad()
-    def _apply_swtp_to_kv(self, k, v, saliency, keep_ratio, num_summary):
-        """
-        Reduce K, V along the token dimension using saliency-based top-k selection
-        plus mean-pooled summary tokens.
-
-        Args:
-            k, v: [B, T, H, D]
-            saliency: [T] per-token saliency
-            keep_ratio: fraction of tokens to keep as high-fidelity
-            num_summary: number of summary tokens replacing the dropped portion
-
-        Returns:
-            k_reduced, v_reduced: [B, K + M, H, D] where K = T*keep_ratio, M = num_summary
-            kept_indices: [K] long tensor (original positions of kept tokens)
-        """
-        T = saliency.numel()
-        K = int(T * keep_ratio)
-        K = max(1, min(T, K))
-
-        saliency_dev = saliency.to(k.device).float()
-        sel = saliency_dev.topk(K).indices
-        top_idx_sorted, _ = sel.sort()  # restore original temporal-spatial order
-
-        # Build keep mask
-        keep_mask = torch.zeros(T, dtype=torch.bool, device=k.device)
-        keep_mask[top_idx_sorted] = True
-
-        # Kept tokens
-        k_kept = k.index_select(1, top_idx_sorted)
-        v_kept = v.index_select(1, top_idx_sorted)
-
-        # Summary tokens: mean-pool the dropped tokens into <=num_summary tokens.
-        if num_summary > 0 and (~keep_mask).any():
-            drop_idx = (~keep_mask).nonzero(as_tuple=True)[0]
-            k_dropped = k.index_select(1, drop_idx)        # [B, T-K, H, D]
-            v_dropped = v.index_select(1, drop_idx)
-            T_dropped = k_dropped.shape[1]
-            if T_dropped >= num_summary:
-                group = T_dropped // num_summary
-                k_dropped = k_dropped[:, :num_summary * group]
-                v_dropped = v_dropped[:, :num_summary * group]
-                k_summary = k_dropped.view(k.shape[0], num_summary, group, *k.shape[2:]).mean(dim=2)
-                v_summary = v_dropped.view(v.shape[0], num_summary, group, *v.shape[2:]).mean(dim=2)
-            else:
-                # Fewer dropped than summary slots → just keep them as-is
-                k_summary = k_dropped
-                v_summary = v_dropped
-            k_reduced = torch.cat([k_kept, k_summary], dim=1)
-            v_reduced = torch.cat([v_kept, v_summary], dim=1)
-        else:
-            k_reduced = k_kept
-            v_reduced = v_kept
-
-        return k_reduced, v_reduced, top_idx_sorted
+    def _apply_swtp_to_kv(self, k, v, saliency, keep_ratio, num_summary,
+                          token_grid=None, mode="standard"):
+        from .utils.swtp import apply_swtp_to_kv
+        return apply_swtp_to_kv(
+            k, v, saliency,
+            keep_ratio=keep_ratio,
+            num_summary=num_summary,
+            token_grid=token_grid,
+            energy_cover=self.swtp_energy_cover,
+            mode=mode,
+            compensate_summary_norm=True,
+        )
 
     @torch.no_grad()
     def _append_swtp_kv_segments(
@@ -480,24 +467,25 @@ class WanI2VFast:
         pending_segments,
         chunk_id,
         token_saliency,
+        token_grid=None,
+        is_sink=False,
     ):
         """
         Append a new chunk's K, V to the dynamic KV cache, optionally applying
         SWTP token pruning based on token_saliency.
 
-        Args:
-            kv_cache:       list of per-layer cache dicts (dynamic mode)
-            pending_segments: list of {'k', 'v', 'token_count'} dicts from context forward
-            chunk_id:       current chunk id
-            token_saliency: [T] CPU tensor of per-token saliency, OR None to skip SWTP
+        Sink chunks are never pruned (matches SWTP docs). Low-Gini chunks
+        fall back to uniform lattice pooling instead of storing full KV forever.
         """
         if pending_segments is None:
             return
 
-        do_swtp = (token_saliency is not None)
-        gini = self._gini_coefficient(token_saliency) if do_swtp else 0.0
-        if do_swtp and gini < self.swtp_min_saliency_gini:
-            do_swtp = False  # fallback: uniform saliency, store full K/V
+        do_swtp = (token_saliency is not None) and (not is_sink)
+        mode = "standard"
+        if do_swtp:
+            gini = self._gini_coefficient(token_saliency)
+            if gini < self.swtp_min_saliency_gini:
+                mode = "uniform"
 
         for layer_cache, pending in zip(kv_cache, pending_segments):
             if pending is None:
@@ -508,25 +496,32 @@ class WanI2VFast:
                 k_red, v_red, kept_idx = self._apply_swtp_to_kv(
                     k_full, v_full, token_saliency,
                     self.swtp_keep_ratio, self.swtp_num_summary,
+                    token_grid=token_grid, mode=mode,
                 )
                 payload = {
                     'chunk_id': int(chunk_id),
-                    'is_sink': False,
+                    'is_sink': bool(is_sink),
                     'is_swtp': True,
+                    'is_gist': False,
+                    'memory_tier': 'L1',
                     'token_count': int(k_red.shape[1]),
                     'k': k_red,
                     'v': v_red,
-                    'num_kept': int(kept_idx.numel()),
-                    'num_summary': int(k_red.shape[1]) - int(kept_idx.numel()),
+                    'num_kept': int(kept_idx.numel()) if hasattr(kept_idx, 'numel') else 0,
+                    'num_summary': int(k_red.shape[1]) - (int(kept_idx.numel()) if hasattr(kept_idx, 'numel') else 0),
+                    'token_grid': token_grid,
                 }
             else:
                 payload = {
                     'chunk_id': int(chunk_id),
-                    'is_sink': False,
+                    'is_sink': bool(is_sink),
                     'is_swtp': False,
+                    'is_gist': False,
+                    'memory_tier': 'L0',
                     'token_count': int(k_full.shape[1]),
                     'k': k_full,
                     'v': v_full,
+                    'token_grid': token_grid,
                 }
             layer_cache['segments'].append(payload)
             local_end_index = sum(s['token_count'] for s in layer_cache['segments'])
@@ -625,6 +620,11 @@ class WanI2VFast:
         motion score (so heuristic MoCE is unchanged)."""
         return seg.get('_sel_score', seg['motion_score'])
 
+    def _archive_rank_key_consol(self, seg):
+        from .utils.memory_consolidation import rank_score
+        meta = self._chunk_meta.get(int(seg['chunk_id']))
+        return rank_score(seg, meta, self.consolidation)
+
     @torch.no_grad()
     def _score_archive_learned(self, archive_segments, current_segment):
         """Populate seg['_sel_score'] for each archive candidate using the learned
@@ -672,6 +672,44 @@ class WanI2VFast:
             util = [util]
         for seg, u in zip(archive_segments, util):
             seg['_sel_score'] = float(u)
+
+    def _update_consolidation_utilities(self, archive_segments, keep_count):
+        """C1: refresh EMA utilities and hysteresis streaks for archive candidates."""
+        from .utils.memory_consolidation import update_utility_ema, rank_score
+        cfg = self.consolidation
+        if not cfg.enabled or not archive_segments:
+            return None
+        for seg in archive_segments:
+            cid = int(seg['chunk_id'])
+            meta = self._chunk_meta.setdefault(cid, {'chunk_id': cid})
+            score = float(seg.get('_sel_score', seg.get('motion_score', 0.0)))
+            update_utility_ema(
+                meta, score,
+                beta=cfg.beta,
+                patience=cfg.patience,
+                stabilize_thr=cfg.stabilize_thr,
+                keep_threshold=None,
+            )
+        ranked = sorted(
+            archive_segments,
+            key=lambda s: rank_score(s, self._chunk_meta.get(int(s['chunk_id'])), cfg),
+            reverse=True,
+        )
+        thr = None
+        if keep_count > 0 and ranked:
+            thr = rank_score(
+                ranked[min(keep_count, len(ranked)) - 1],
+                self._chunk_meta.get(int(ranked[min(keep_count, len(ranked)) - 1]['chunk_id'])),
+                cfg,
+            )
+        for seg in archive_segments:
+            meta = self._chunk_meta.setdefault(int(seg['chunk_id']), {'chunk_id': int(seg['chunk_id'])})
+            u = float(meta.get('u_ema', seg.get('_sel_score', seg.get('motion_score', 0.0))))
+            if thr is not None and u < thr:
+                meta['low_streak'] = int(meta.get('low_streak', 0)) + 1
+            else:
+                meta['low_streak'] = 0
+        return thr
 
     def _dump_oracle(self, path):
         """Persist teacher records + per-chunk metadata.
@@ -739,6 +777,7 @@ class WanI2VFast:
         min_keep_chunks = max(0, self.ma_kv_min_keep_chunks)
         evicted_segments = []
         keep_chunk_ids = None
+        self._pending_tier_map = None
         for layer_cache in kv_cache:
             segments = layer_cache['segments']
             if not segments:
@@ -777,29 +816,66 @@ class WanI2VFast:
                         self._score_archive_learned(archive_segments, non_sink_segments[-1])
                     keep_count = max(min_keep_chunks, int(math.ceil(len(archive_segments) * keep_ratio)))
                     keep_count = min(len(archive_segments), keep_count)
+                    rank_key = (
+                        self._archive_rank_key_consol
+                        if self.consolidation.enabled else self._archive_rank_key
+                    )
+                    if self.consolidation.enabled:
+                        self._update_consolidation_utilities(archive_segments, keep_count)
                     if keep_count > 0:
-                        # Sort archive candidates by retention score descending (learned
-                        # utility if set, else motion score). The two-stage diversity
-                        # selector consumes this ordering (no-op when pool==0).
                         sorted_archive = sorted(
-                            archive_segments,
-                            key=self._archive_rank_key,
-                            reverse=True,
+                            archive_segments, key=rank_key, reverse=True,
                         )
-                        selected = self._select_archive_by_diversity(
-                            sorted_archive, archive_budget=keep_count,
-                        )
-                        # Preserve chronological order in the cache (selection is unordered)
-                        kept_archive = sorted(selected, key=lambda seg: seg['chunk_id'])
+                        if self.consolidation.enabled:
+                            from .utils.memory_consolidation import (
+                                assign_archive_tiers, enforce_gist_budget,
+                            )
+                            tier_map = assign_archive_tiers(
+                                archive_segments,
+                                keep_count=keep_count,
+                                chunk_meta=self._chunk_meta,
+                                cfg=self.consolidation,
+                            )
+                            tier_map = enforce_gist_budget(
+                                tier_map, archive_segments, self._chunk_meta,
+                                self.consolidation,
+                            )
+                            self._pending_tier_map = tier_map
+                            kept_archive = sorted(
+                                [s for s in archive_segments
+                                 if tier_map.get(int(s['chunk_id'])) in ('L1', 'L2')],
+                                key=lambda seg: seg['chunk_id'],
+                            )
+                        else:
+                            self._pending_tier_map = None
+                            selected = self._select_archive_by_diversity(
+                                sorted_archive, archive_budget=keep_count,
+                            )
+                            kept_archive = sorted(selected, key=lambda seg: seg['chunk_id'])
                     else:
+                        self._pending_tier_map = None
                         kept_archive = []
                     if attention_budget is not None:
-                        kept_segments = self._enforce_attention_budget(
-                            sink_segments=sink_segments,
-                            archive_segments=kept_archive,
-                            recent_segments=recent_segments,
-                            attention_budget=attention_budget,
-                        )
+                        # Budget enforcement must use the same ranking key.
+                        if self.consolidation.enabled:
+                            _orig = self._archive_rank_key
+                            self._archive_rank_key = self._archive_rank_key_consol  # type: ignore
+                            try:
+                                kept_segments = self._enforce_attention_budget(
+                                    sink_segments=sink_segments,
+                                    archive_segments=kept_archive,
+                                    recent_segments=recent_segments,
+                                    attention_budget=attention_budget,
+                                )
+                            finally:
+                                self._archive_rank_key = _orig  # type: ignore
+                        else:
+                            kept_segments = self._enforce_attention_budget(
+                                sink_segments=sink_segments,
+                                archive_segments=kept_archive,
+                                recent_segments=recent_segments,
+                                attention_budget=attention_budget,
+                            )
                     else:
                         kept_segments = sink_segments + kept_archive + recent_segments
                     keep_chunk_ids = {segment['chunk_id'] for segment in kept_segments}
@@ -816,55 +892,91 @@ class WanI2VFast:
                         if segment['chunk_id'] in keep_chunk_ids
                     ]
             layer_cache['segments'] = kept_segments
-            # MoSaiC: apply SWTP to chunks that just got promoted to archive
-            # (i.e., kept but not sink and not in last recent_window non-sink).
-            if self.enable_swtp:
-                self._apply_swtp_to_archive_segments(
-                    kept_segments, recent_window=max(0, self.ma_kv_recent_window),
-                )
+            # Compress archive tiers: SWTP and/or Consolidation L1/L2.
+            self._apply_archive_compression(
+                kept_segments, recent_window=max(0, self.ma_kv_recent_window),
+            )
             local_end_index = sum(segment['token_count'] for segment in kept_segments)
             layer_cache['local_end_index'].fill_(local_end_index)
         return evicted_segments
 
 
-    def _apply_swtp_to_archive_segments(self, segments, recent_window):
-        """
-        MoSaiC SWTP step. After eviction, identify chunks that are now
-        archive (non-sink, not in last `recent_window` non-sink) and have
-        not been SWTP-compressed yet. Compress them in place using stored
-        token_saliency.
-        """
+    def _apply_archive_compression(self, segments, recent_window):
+        """Apply L1 SWTP / L2 gist compression to archive segments in place."""
         if not segments:
             return
         non_sink = [s for s in segments if not s['is_sink']]
         recent_chunk_ids = set(
             s['chunk_id'] for s in non_sink[-recent_window:]
         ) if recent_window > 0 else set()
+        tier_map = getattr(self, '_pending_tier_map', None) or {}
 
         for seg in segments:
-            if seg['is_sink']:
+            if seg['is_sink'] or seg['chunk_id'] in recent_chunk_ids:
+                seg.setdefault('memory_tier', 'L0')
                 continue
-            if seg['chunk_id'] in recent_chunk_ids:
-                continue
-            if seg.get('is_swtp', False):
-                continue  # already compressed
+            cid = int(seg['chunk_id'])
+            tier = tier_map.get(cid)
+            if tier is None:
+                # Legacy SWTP path (consolidation off): SWTP every archive chunk once.
+                if not self.enable_swtp or seg.get('is_swtp', False):
+                    continue
+                target = 'L1'
+            else:
+                target = tier
+                if target == 'L3':
+                    continue  # should already be dropped
+                if target == 'L1' and seg.get('is_swtp') and not seg.get('is_gist'):
+                    seg['memory_tier'] = 'L1'
+                    continue
+                if target == 'L2' and seg.get('is_gist'):
+                    seg['memory_tier'] = 'L2'
+                    continue
+                if target == 'L1' and not self.enable_swtp and not self.consolidation.tiers_enabled:
+                    seg['memory_tier'] = 'L1'
+                    continue
+
             sal = seg.get('token_saliency', None)
-            if sal is None:
-                continue  # no saliency available (e.g., first chunk)
-            # Check Gini fallback
-            gini = self._gini_coefficient(sal)
-            if gini < self.swtp_min_saliency_gini:
-                seg['token_saliency'] = None  # free memory; skip SWTP
-                continue
+            grid = seg.get('token_grid', None)
+            if target == 'L2':
+                # Gist demotion: summary tokens only. Synthesize flat saliency if missing.
+                if sal is None:
+                    sal = torch.ones(int(seg['token_count']), dtype=torch.float32)
+                    grid = None
+                mode = 'gist'
+                keep_ratio = 0.0
+                num_summary = int(self.consolidation.gist_tokens)
+            else:
+                # L1 SWTP
+                if sal is None:
+                    # No saliency → uniform lattice rather than leaving full forever.
+                    sal = torch.ones(int(seg['k'].shape[1]), dtype=torch.float32)
+                    mode = 'uniform'
+                else:
+                    gini = self._gini_coefficient(sal)
+                    mode = 'uniform' if gini < self.swtp_min_saliency_gini else 'standard'
+                keep_ratio = self.swtp_keep_ratio
+                num_summary = self.swtp_num_summary
+                if not self.enable_swtp and not self.consolidation.tiers_enabled:
+                    continue
+
             k_red, v_red, _ = self._apply_swtp_to_kv(
                 seg['k'], seg['v'], sal,
-                self.swtp_keep_ratio, self.swtp_num_summary,
+                keep_ratio, num_summary,
+                token_grid=grid, mode=mode,
             )
             seg['k'] = k_red
             seg['v'] = v_red
             seg['token_count'] = int(k_red.shape[1])
             seg['is_swtp'] = True
-            seg['token_saliency'] = None  # free now
+            seg['is_gist'] = (target == 'L2')
+            seg['memory_tier'] = target
+            seg['token_saliency'] = None
+
+    def _apply_swtp_to_archive_segments(self, segments, recent_window):
+        """Backward-compatible alias for SWTP (no consolidation tiers)."""
+        self._pending_tier_map = None
+        self._apply_archive_compression(segments, recent_window)
 
     def _append_motion_adaptive_kv_segments(
         self,
@@ -874,21 +986,24 @@ class WanI2VFast:
         motion_score,
         is_sink,
         token_saliency=None,
+        token_grid=None,
         camera_forward=None,
+        runtime_stats=None,
     ):
         """
         Append a new chunk's K/V to the dynamic cache. If `token_saliency` is
-        provided (MoSaiC mode), stash it in the segment payload so that SWTP
+        provided (SWTP), stash it in the segment payload so that SWTP
         can be applied lazily when the chunk transitions into the archive
         tier (via _evict_motion_adaptive_kv_cache). If `camera_forward` is
         provided, stash for trajectory-diversity archive selection.
         """
         if pending_segments is None:
             return
-        # Learned selector / oracle need per-chunk content + pose features.
+        # Learned selector / oracle / consolidation need per-chunk metadata.
         need_meta = (
             (self.selector == "learned")
             or self.collect_oracle
+            or self.consolidation.enabled
         )
         # Content features are decision-context only (layer-0). Never materialize
         # float32 copies of every layer's K/V — that was the main learned-vs-heuristic
@@ -923,8 +1038,11 @@ class WanI2VFast:
                 'motion_score': float(motion_score),
                 'is_sink': bool(is_sink),
                 'token_count': int(pending_segment['token_count']),
-                'token_saliency': seg_saliency,      # MoSaiC: stash for lazy SWTP at archive promotion
+                'token_saliency': seg_saliency,      # SWTP: stash for lazy prune at archive promotion
+                'token_grid': token_grid,
                 'is_swtp': False,                    # not compressed yet
+                'is_gist': False,
+                'memory_tier': 'L0',
                 'camera_forward': cf_seg,            # trajectory-diversity: unit forward axis (3,)
                 # Only layer-0 needs content features for the shared keep decision.
                 'k_centroid': k_centroid if is_layer0 else None,
@@ -945,6 +1063,7 @@ class WanI2VFast:
                 if cf is not None and not isinstance(cf, list):
                     cf = cf.detach().float().cpu().tolist() if torch.is_tensor(cf) else list(cf)
                 pose = self._chunk_poses.get(int(chunk_id))
+                revisited = []
                 if pose is not None:
                     for oid, om in list(self._chunk_meta.items()):
                         op = om.get('pose')
@@ -953,6 +1072,11 @@ class WanI2VFast:
                         if se3_distance(pose, op, self._sel_translation_scale) <= self._revisit_radius:
                             om['revisit_count'] = int(om.get('revisit_count', 0)) + 1
                             om['last_observed'] = int(chunk_id)
+                            revisited.append(int(oid))
+                if runtime_stats is not None and revisited:
+                    from .utils.memory_consolidation import update_revisit_coverage
+                    retained_ids = {int(s['chunk_id']) for s in segments}
+                    update_revisit_coverage(runtime_stats, revisited, retained_ids)
                 self._chunk_meta[int(chunk_id)] = {
                     'chunk_id': int(chunk_id),
                     'motion_score': float(motion_score),
@@ -963,6 +1087,10 @@ class WanI2VFast:
                     'pose': pose,
                     'revisit_count': 0,
                     'last_observed': int(chunk_id),
+                    'u_ema': None,
+                    'low_streak': 0,
+                    'high_streak': 0,
+                    'stabilized': False,
                 }
 
 
@@ -1493,10 +1621,11 @@ class WanI2VFast:
                         extra={"motion_score": current_motion_score},
                     )
                 if self.enable_motion_adaptive_kv_eviction:
-                    # MoSaiC: precompute token saliency for lazy SWTP at archive promotion.
+                    # SWTP: precompute token saliency for lazy SWTP at archive promotion.
                     swtp_saliency = None
-                    if self.enable_swtp:
-                        swtp_saliency = self._compute_token_saliency(x0, prev_x0)
+                    swtp_grid = None
+                    if self.enable_swtp or self.consolidation.tiers_enabled:
+                        swtp_saliency, swtp_grid = self._compute_token_saliency(x0, prev_x0)
                     _, pending_kv_segments = self.model(
                         x=[x0],
                         t=timestep,
@@ -1515,11 +1644,13 @@ class WanI2VFast:
                         motion_score=current_motion_score,
                         is_sink=(chunk_id < sink_chunk_count),
                         token_saliency=swtp_saliency,
+                        token_grid=swtp_grid,
                         camera_forward=current_camera_forward,
+                        runtime_stats=runtime_stats,
                     )
                 elif self.enable_swtp:
                     # Compute per-token saliency from latent residual
-                    token_saliency = self._compute_token_saliency(x0, prev_x0)
+                    token_saliency, token_grid = self._compute_token_saliency(x0, prev_x0)
                     _, pending_kv_segments = self.model(
                         x=[x0],
                         t=timestep,
@@ -1531,6 +1662,8 @@ class WanI2VFast:
                         pending_segments=pending_kv_segments,
                         chunk_id=chunk_id,
                         token_saliency=token_saliency,
+                        token_grid=token_grid,
+                        is_sink=(chunk_id < sink_chunk_count),
                     )
                     # Track stats: count of SWTP-applied vs full-stored chunks
                     if self_kv_cache and self_kv_cache[0]['segments']:
@@ -1589,6 +1722,9 @@ class WanI2VFast:
                         'chunk_id': seg['chunk_id'],
                         'is_sink': seg['is_sink'],
                         'token_count': int(seg.get('token_count', 0)),
+                        'memory_tier': seg.get('memory_tier', 'L0'),
+                        'is_swtp': bool(seg.get('is_swtp', False)),
+                        'is_gist': bool(seg.get('is_gist', False)),
                     })
             else:
                 retained_segments = []
@@ -1670,6 +1806,13 @@ class WanI2VFast:
                 float(sorted(chunk_times)[min(len(chunk_times) - 1, int(0.95 * (len(chunk_times) - 1)))])
                 if chunk_times else 0.0
             ),
+            "consolidation": self.consolidation.mode,
+            "revisit_coverage": runtime_stats.get("revisit_coverage"),
+            "revisit_events": runtime_stats.get("revisit_events", 0),
+            "tier_counts": {
+                t: sum(1 for s in retained_segments if s.get("memory_tier") == t)
+                for t in ("L0", "L1", "L2")
+            } if retained_segments else None,
         }
         self.last_generation_stats = generation_stats
         self._log_generation_summary(generation_stats)

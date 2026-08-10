@@ -4,12 +4,11 @@ Sparse KV inference for camera-conditioned **LingBot-World-Fast**: keep a
 bounded attention context without forgetting revisited viewpoints.
 
 This repository is the research / collaboration tree around **Chunk Retention
-(CR)** — especially **World-State CR** — with optional **SWTP** token pruning.
-The product name **MoSaiC** = World-State CR ⊕ SWTP (secondary; not required
-for the main claim).
+(CR)** — especially **World-State CR** (default **v3** = future-use selector +
+Memory Consolidation + SWTP).
 
 > **Sole source tree:** [`lingbot-world/`](lingbot-world/)  
-> Paper LaTeX: [`MoSaiC/`](MoSaiC/) · Docs: [`docs/`](docs/) · Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+> Paper LaTeX: [`paper/`](paper/) · Docs: [`docs/`](docs/) · Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
 ---
 
@@ -23,7 +22,8 @@ is fast but drops past viewpoints; full history is faithful but too expensive.
 > new chunk is generated?*
 
 Default answer: tiered **sink / recent / archive**, with archive ranked by an
-11-D **World-State** ChunkSelector trained for **future coverage**.
+11-D **World-State** ChunkSelector trained for **future coverage**, plus
+in-cache Memory Consolidation (EMA + L1/L2 demotion via SWTP).
 
 ---
 
@@ -34,17 +34,13 @@ Default answer: tiered **sink / recent / archive**, with archive ranked by an
 | Sliding Window | FIFO local attention baseline | `--memory_policy window` |
 | Heuristic CR | Motion-score archive ranking (ablation) | `--memory_policy heuristic_cr` |
 | Learned CR | 5-D ChunkSelector (`selector_all4.pt`) | `--memory_policy learned_cr` |
-| **World-State CR** | **Default** 11-D future-use selector (`selector_ws_future_v1.pt`) | `--memory_policy world_state_cr` |
+| **World-State CR (v3)** | **Default**: future-use selector + consolidation + SWTP | `--memory_policy world_state_cr` |
+| World-State CR v2 | Selector only (former default) | `--memory_policy world_state_cr_v2` |
 | World-State CR v1 | Attention-mass ablation (`selector_ws_v1.pt`) | `--memory_policy world_state_cr_v1` |
-| SWTP | Token pruning inside archive chunks | `--enable_swtp` |
-| MoSaiC | World-State CR ⊕ SWTP | `world_state_cr` + `--enable_swtp` |
+| SWTP-only | Token pruning without CR | `--enable_swtp` (no CR policy) |
 
 All CR variants are **post-generation** retention: generate a chunk → score
-history → keep a budgeted archive. Evicted chunks are not retrieved from host.
-
-Default World-State CR = former experimental `world_state_cr_future`
-(Future Coverage Oracle + `world_state.v2`). The old name remains a
-back-compat alias.
+history → keep a budgeted archive.
 
 ---
 
@@ -57,27 +53,25 @@ back-compat alias.
 ├── CONTRIBUTING.md
 ├── env.sh                    ← paths: LINGBOT_WORLD, CKPT_DIR, WORLDKV_ROOT, …
 ├── docs/
-│   ├── method/               ← CHUNK_RETENTION / SWTP / MoSaiC
+│   ├── method/               ← CHUNK_RETENTION / SWTP / MEMORY_CONSOLIDATION
 │   └── experiments/          ← RealCam-Vid protocol & notes
-├── MoSaiC/                   ← ICLR paper LaTeX
+├── paper/                    ← ICLR paper LaTeX
 ├── lingbot-world/            ← ★ sole source (edit here)
 │   ├── generate_fast.py      ← CLI entry
 │   ├── train_selector.py     ← ChunkSelector training
-│   ├── wan/                  ← CR / SWTP runtime
+│   ├── wan/                  ← CR / SWTP / consolidation runtime
 │   ├── assets/selectors/     ← small .pt checkpoints (tracked)
 │   ├── examples/             ← demo clips 00–05
 │   ├── scripts/              ← run_*.sh
 │   ├── bench/                ← RealCam-Vid + WorldKV baseline
 │   └── tests/
-├── tools/pack_mosaic.sh      ← portable zip from lingbot-world/
 ├── weights/                  ← symlink stubs only (see weights/README.md)
 ├── third_party/              ← clone WorldKV here (not vendored)
 └── artifacts/                ← local experiment dumps (gitignored)
 ```
 
 **Not in git (and should stay local):** model weights, generated videos,
-`lingbot-world/output/`, RealCam-Vid raw clips, `third_party/WorldKV` checkout,
-and the generated `lingbot-world-mosaic/` package.
+`lingbot-world/output/`, RealCam-Vid raw clips, `third_party/WorldKV` checkout.
 
 ---
 
@@ -134,7 +128,6 @@ Root convenience symlinks (same scripts):
 ./run_learned_cr.sh
 ./run_world_state_cr.sh
 ./run_swtp.sh
-./run_mosaic.sh
 ```
 
 ### 4. Direct CLI
@@ -158,82 +151,19 @@ torchrun --nproc_per_node=8 generate_fast.py \
   --prompt "..."
 ```
 
-Default CR tier ratio: **sink : recent : archive_min = 1 : 1 : 2**
-(`sink_size=1`, `ma_kv_recent_window=1`, `ma_kv_min_keep_chunks=2`,
-`ma_kv_keep_ratio=0.5`).
-
 ---
 
-## RealCam-Vid evaluation (default protocol)
+## RealCam-Vid evaluation
 
-Default quality protocol aligns with **WorldKV revisit memory**:
-detect revisit frames from GT poses → compare revisit vs first-visit with
-**PSNR / SSIM / LPIPS / FID**, plus **FPS / ctx / peakGB**.
-
-### Official subsets
-
-| Subset | Clips | Role |
-|--------|------:|------|
-| `default_loop` | 24 | Loop / revisit (primary) |
-| `default_random` | 40 | Random forward (seed=42) |
-| `default_all` | 64 | loop + random |
-
-```bash
-source env.sh
-cd "$LINGBOT_WORLD"
-bash bench/realcamvid/build_subsets.sh   # needs local RealCam-Vid archive
-
-# Generate (8× GPU example)
-torchrun --nproc_per_node=8 bench/batch_generate.py \
-  --ckpt_dir "$CKPT_DIR" \
-  --subset default_loop \
-  --out_dir output/realcamvid_ws_vs_window \
-  --methods window,world_state_cr \
-  --frame_num 481 --ulysses_size 8
-
-# Evaluate
-REALCAMVID_OUT=output/realcamvid_ws_vs_window \
-REALCAMVID_SUBSET=default_loop \
-METHODS=window,world_state_cr \
-  bash bench/realcamvid/run_worldkv_eval.sh
-```
-
-Optional WorldKV baseline:
-
-```bash
-git clone https://github.com/cvlab-kaist/WorldKV.git third_party/WorldKV
-source env.sh
-cd lingbot-world
-bash bench/realcamvid/run_worldkv_official.sh
-```
-
-Details: [`docs/experiments/REALCAMVID.md`](docs/experiments/REALCAMVID.md),
-[`lingbot-world/bench/realcamvid/README.md`](lingbot-world/bench/realcamvid/README.md).
-
-### Example `default_loop` numbers (24 clips)
-
-| Method | PSNR↑ | SSIM↑ | LPIPS↓ | FID↓ | FPS↑ | ctx | peakGB |
-|--------|------:|------:|-------:|-----:|-----:|----:|-------:|
-| Window | 9.830 | 0.300 | 0.726 | 67.0 | 1.18 | 41471 | 54.7 |
-| World-State v1 | 10.026 | 0.327 | 0.719 | 66.2 | 1.47 | 21489 | 39.2 |
-| **World-State CR (default)** | **10.138** | **0.328** | **0.713** | **61.4** | **1.47** | **21489** | **39.2** |
-
----
-
-## Train / ablate the ChunkSelector
+See [`docs/experiments/REALCAMVID.md`](docs/experiments/REALCAMVID.md) and
+`lingbot-world/bench/realcamvid/`. Typical multi-GPU launch:
 
 ```bash
 cd lingbot-world
-# Collect attention-mass oracles, then train future-use (default) weights:
-python train_selector.py \
-  --label_type future_use_v1 --feature_schema v2 \
-  --oracle path/to/oracle_dense_*.pt \
-  --out assets/selectors/selector_ws_future_v1.pt
+N=4 U=2 METHODS=window,world_state_cr \
+  OUT=output/realcamvid_run CLIPS=bench/realcamvid/clips_default_loop \
+  bash bench/run_dp2.sh --frame_num 481
 ```
-
-Oracle helpers: `scripts/collect_oracle_ws.sh`.  
-Feature schemas & formulas: `wan/modules/chunk_selector.py`,
-`docs/method/CHUNK_RETENTION.md`.
 
 ---
 
@@ -242,8 +172,7 @@ Feature schemas & formulas: `wan/modules/chunk_selector.py`,
 ```bash
 source env.sh
 cd "$LINGBOT_WORLD"
-python -m pytest tests/ -q
-# or: python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
 ---
@@ -254,27 +183,23 @@ python -m pytest tests/ -q
 |-------|------|
 | Chunk Retention (CR variants) | [`docs/method/CHUNK_RETENTION.md`](docs/method/CHUNK_RETENTION.md) |
 | SWTP | [`docs/method/SWTP.md`](docs/method/SWTP.md) |
-| MoSaiC cascade | [`docs/method/MoSaiC.md`](docs/method/MoSaiC.md) |
+| Memory Consolidation | [`docs/method/MEMORY_CONSOLIDATION.md`](docs/method/MEMORY_CONSOLIDATION.md) |
 | RealCam-Vid protocol | [`docs/experiments/REALCAMVID.md`](docs/experiments/REALCAMVID.md) |
 | Experiment index | [`docs/experiments/INDEX.md`](docs/experiments/INDEX.md) |
 | Weights layout | [`weights/README.md`](weights/README.md) |
 | WorldKV third-party | [`third_party/README.md`](third_party/README.md) |
 | Source package README | [`lingbot-world/README.md`](lingbot-world/README.md) |
-| Paper | [`MoSaiC/iclr2027_conference.tex`](MoSaiC/iclr2027_conference.tex) |
+| Paper | [`paper/iclr2027_conference.tex`](paper/iclr2027_conference.tex) |
 | Contributing | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 ---
 
 ## Collaboration notes
 
-1. **Edit only `lingbot-world/`** (+ `docs/`, `MoSaiC/` as needed).
+1. **Edit only `lingbot-world/`** (+ `docs/`, `paper/` as needed).
 2. Never commit weights, videos, or `output/` / `artifacts/`.
-3. Keep PRs small; run `pytest` before review.
-4. Portable release zip (optional):
-   ```bash
-   bash tools/pack_mosaic.sh /tmp/lingbot-world-mosaic.zip
-   ```
-5. Prefer discussing API changes (`--memory_policy` names, selector defaults)
+3. Keep PRs small; run unit tests before review.
+4. Prefer discussing API changes (`--memory_policy` names, selector defaults)
    before merging.
 
 ---

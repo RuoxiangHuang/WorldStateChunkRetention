@@ -17,9 +17,6 @@ fi
 # ★ Primary source tree (edit here)
 export LINGBOT_WORLD="${LINGBOT_WORLD:-$LINGBOT_ROOT/lingbot-world}"
 
-# Optional generated package (tools/pack_mosaic.sh); not the source of truth
-export LINGBOT_MOSAIC="${LINGBOT_MOSAIC:-$LINGBOT_ROOT/lingbot-world-mosaic}"
-
 # Optional WorldKV baseline — clone into third_party/WorldKV (see third_party/README.md)
 export WORLDKV_ROOT="${WORLDKV_ROOT:-$LINGBOT_ROOT/third_party/WorldKV}"
 

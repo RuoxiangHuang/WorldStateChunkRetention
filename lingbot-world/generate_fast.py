@@ -53,6 +53,33 @@ def _resolve_input_path(path, should_exist=True):
     return path
 
 
+def _apply_ws_v2_selector(args):
+    """Future-use selector + world_state.v2 features (shared by v2/v3)."""
+    args.enable_motion_adaptive_kv_eviction = True
+    args.selector = "learned"
+    if not getattr(args, "selector_ckpt", None):
+        args.selector_ckpt = resolve_selector_ckpt(
+            None, schema="world_state_future")
+
+
+def _apply_ws_v3_consolidation(args):
+    """v3 package: SWTP + consolidation full.
+
+    Default knobs match default_loop sweep winner ``ws_v3_a05_g64``:
+    rank_alpha=0.5, gist_tokens=64, l2_bottom_ratio=0.5.
+    """
+    args.enable_swtp = True
+    args.consolidation = "full"
+    if int(getattr(args, "archive_diversity_pool", 0) or 0) <= 0:
+        args.archive_diversity_pool = 4
+    if getattr(args, "consol_rank_alpha", None) is None:
+        args.consol_rank_alpha = 0.5
+    if getattr(args, "consol_gist_tokens", None) is None:
+        args.consol_gist_tokens = 64
+    if getattr(args, "consol_l2_bottom_ratio", None) is None:
+        args.consol_l2_bottom_ratio = 0.5
+
+
 def _apply_memory_policy(args):
     """Map --memory_policy onto low-level flags.
 
@@ -60,16 +87,22 @@ def _apply_memory_policy(args):
       window                 — sliding-window baseline (no MoCE)
       heuristic_cr           — motion-score archive ranking
       learned_cr             — 5-D ChunkSelector (selector_all4.pt)
-      world_state_cr         — default World-State CR (future-use selector,
-                              selector_ws_future_v1.pt / world_state.v2)
+      world_state_cr         — default = v3 (v2 selector + consolidation full)
+      world_state_cr_v3      — alias of world_state_cr
+      world_state_cr_consol  — alias of world_state_cr
       world_state_cr_future  — alias of world_state_cr (back-compat)
+      world_state_cr_v2      — frozen future-use selector only (former default)
       world_state_cr_v1      — frozen attention-mass selector (selector_ws_v1.pt)
     """
     policy = getattr(args, "memory_policy", None)
     if policy is None or policy == "legacy":
         return
-    # Back-compat alias: former experimental name is now the default.
-    if policy == "world_state_cr_future":
+    # Aliases of the default World-State CR (v3).
+    if policy in (
+        "world_state_cr_future",
+        "world_state_cr_v3",
+        "world_state_cr_consol",
+    ):
         policy = "world_state_cr"
         args.memory_policy = policy
     if policy == "window":
@@ -87,12 +120,14 @@ def _apply_memory_policy(args):
             args.selector_ckpt = resolve_selector_ckpt(
                 None, schema="learned")
     elif policy == "world_state_cr":
-        # Default: Future Coverage Oracle + world_state.v2 features.
-        args.enable_motion_adaptive_kv_eviction = True
-        args.selector = "learned"
-        if not getattr(args, "selector_ckpt", None):
-            args.selector_ckpt = resolve_selector_ckpt(
-                None, schema="world_state_future")
+        # Default v3: future-use v2 selector + Memory Consolidation + SWTP.
+        _apply_ws_v2_selector(args)
+        _apply_ws_v3_consolidation(args)
+    elif policy == "world_state_cr_v2":
+        # Frozen ablation: former default (selector only, no consol/SWTP).
+        _apply_ws_v2_selector(args)
+        args.consolidation = "off"
+        args.enable_swtp = False
     elif policy == "world_state_cr_v1":
         # Frozen ablation: attention-mass oracle + world_state.v1 features.
         args.enable_motion_adaptive_kv_eviction = True
@@ -100,6 +135,8 @@ def _apply_memory_policy(args):
         if not getattr(args, "selector_ckpt", None):
             args.selector_ckpt = resolve_selector_ckpt(
                 None, schema="world_state")
+        args.consolidation = "off"
+        args.enable_swtp = False
     else:
         raise AssertionError(f"Unknown memory_policy: {policy}")
 
@@ -158,6 +195,14 @@ def _validate_args(args):
             "`swtp_num_summary` must be non-negative."
         assert args.swtp_min_saliency_gini >= 0.0, \
             "`swtp_min_saliency_gini` must be non-negative."
+        assert 0.0 < getattr(args, "swtp_energy_cover", 0.9) <= 1.0, \
+            "`swtp_energy_cover` must be in (0, 1]."
+    if getattr(args, "consolidation", "off") != "off":
+        assert args.enable_motion_adaptive_kv_eviction, \
+            "`--consolidation` requires `--enable_motion_adaptive_kv_eviction`."
+        if args.consolidation == "full":
+            assert args.enable_swtp, \
+                "`--consolidation full` requires `--enable_swtp` for L1/L2 compression."
     if args.enable_motion_adaptive_kv_eviction and args.selector == "learned":
         policy = getattr(args, "memory_policy", None)
         if policy == "learned_cr":
@@ -311,15 +356,19 @@ def _parse_args():
         choices=[
             "legacy", "window",
             "heuristic_cr", "learned_cr", "world_state_cr",
+            "world_state_cr_v3",      # alias of world_state_cr
+            "world_state_cr_consol",  # alias of world_state_cr
             "world_state_cr_future",  # alias of world_state_cr
+            "world_state_cr_v2",      # frozen future-use selector only
             "world_state_cr_v1",      # frozen attention-mass ablation
         ],
         help="Chunk retention policy (preferred over raw flags). "
              "window=sliding baseline; heuristic_cr=motion archive; "
              "learned_cr=5-D ChunkSelector; "
-             "world_state_cr=default 11-D future-use selector "
-             "(selector_ws_future_v1.pt); "
-             "world_state_cr_future=alias of world_state_cr; "
+             "world_state_cr=default v3 (future-use selector + consolidation "
+             "full + SWTP); "
+             "world_state_cr_v3/consol/future=aliases of world_state_cr; "
+             "world_state_cr_v2=frozen selector-only (former default); "
              "world_state_cr_v1=frozen attention-mass selector "
              "(selector_ws_v1.pt); "
              "legacy=honour individual --enable_* / --selector flags only.")
@@ -360,7 +409,7 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Enable Saliency-Weighted Token Pruning (SWTP). Token-level pruning within each "
-             "archive chunk based on latent-residual saliency. Combines with MoCE as MoSaiC "
+             "archive chunk based on latent-residual saliency. Used with World-State CR for archive "
              "(lazy SWTP at archive promotion). Standalone SWTP (without MoCE) is also supported.")
     parser.add_argument(
         "--swtp_keep_ratio",
@@ -376,7 +425,45 @@ def _parse_args():
         "--swtp_min_saliency_gini",
         type=float,
         default=0.20,
-        help="Skip SWTP if chunk's saliency Gini falls below this (uniform-motion fallback, default 0.20).")
+        help="If chunk saliency Gini is below this, use uniform lattice pooling "
+             "instead of saliency top-k (default 0.20). Never leaves the chunk uncompressed.")
+    parser.add_argument(
+        "--swtp_energy_cover",
+        type=float,
+        default=0.9,
+        help="Keep the smallest top-K (capped by swtp_keep_ratio) whose saliency "
+             "mass covers this fraction (default 0.9).")
+    parser.add_argument(
+        "--consolidation",
+        type=str,
+        default="off",
+        choices=["off", "ema", "full"],
+        help="Memory Consolidation for World-State CR: off | ema (EMA+hysteresis ranking) | "
+             "full (EMA + L1/L2/L3 tiered demotion). Not WorldKV bank retrieval.")
+    parser.add_argument(
+        "--consol_beta", type=float, default=0.7,
+        help="EMA coefficient for consolidation utility (default 0.7).")
+    parser.add_argument(
+        "--consol_patience", type=int, default=2,
+        help="Consecutive low-utility steps before L2 demotion (default 2).")
+    parser.add_argument(
+        "--consol_stabilize_thr", type=float, default=0.6,
+        help="EMA threshold for marking a chunk stabilized (default 0.6).")
+    parser.add_argument(
+        "--consol_gist_tokens", type=int, default=64,
+        help="Summary-token count for L2 gist demotion (default 64; default_loop sweep winner).")
+    parser.add_argument(
+        "--consol_gist_budget", type=int, default=512,
+        help="Max total L2 gist tokens across archive (default 512).")
+    parser.add_argument(
+        "--consol_rank_alpha", type=float, default=0.5,
+        help="Mix instantaneous selector score into consolidation ranking: "
+             "rank = α·s + (1-α)·u_ema. 0=pure EMA, 1=pure instantaneous "
+             "(default 0.5; default_loop sweep winner).")
+    parser.add_argument(
+        "--consol_l2_bottom_ratio", type=float, default=0.5,
+        help="Fraction of kept archive chunks demoted to L2 gist (bottom by rank). "
+             "0 disables rank-based L2; 0.5 demotes the weaker half (default).")
     parser.add_argument(
         "--archive_diversity_pool",
         type=int,
@@ -549,6 +636,7 @@ def generate(args):
         swtp_keep_ratio=args.swtp_keep_ratio,
         swtp_num_summary=args.swtp_num_summary,
         swtp_min_saliency_gini=args.swtp_min_saliency_gini,
+        swtp_energy_cover=getattr(args, "swtp_energy_cover", 0.9),
         archive_diversity_pool=args.archive_diversity_pool,
         selector=args.selector,
         selector_ckpt=args.selector_ckpt,
@@ -559,6 +647,14 @@ def generate(args):
         oracle_future_horizon=getattr(args, "oracle_future_horizon", 8),
         oracle_future_gamma=getattr(args, "oracle_future_gamma", 0.9),
         oracle_future_alpha=getattr(args, "oracle_future_alpha", 0.5),
+        consolidation=getattr(args, "consolidation", "off"),
+        consol_beta=getattr(args, "consol_beta", 0.7),
+        consol_patience=getattr(args, "consol_patience", 2),
+        consol_stabilize_thr=getattr(args, "consol_stabilize_thr", 0.6),
+        consol_gist_tokens=getattr(args, "consol_gist_tokens", 64),
+        consol_gist_budget=getattr(args, "consol_gist_budget", 512),
+        consol_rank_alpha=getattr(args, "consol_rank_alpha", 0.5),
+        consol_l2_bottom_ratio=getattr(args, "consol_l2_bottom_ratio", 0.5),
     )
     logging.info("Generating video ...")
     video = wan_i2v.generate(

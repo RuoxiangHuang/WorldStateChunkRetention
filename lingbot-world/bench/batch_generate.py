@@ -9,7 +9,7 @@ Run under torchrun, e.g.:
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 batch_generate.py \
       --ckpt_dir "$CKPT_DIR" \
       --clips_dir /path/to/clips --out_dir /path/to/out \
-      --methods window,world_state_cr,mosaic --ulysses_size 8
+      --methods window,world_state_cr --ulysses_size 8
 """
 import argparse, os, sys, json, time, logging, glob, gc, traceback
 import torch
@@ -29,7 +29,7 @@ MA = dict(enable_motion_adaptive_kv_eviction=True,
           ma_kv_min_keep_chunks=int(os.getenv("MA_KV_MIN_KEEP", "2")),
           ma_kv_latent_rescue=True, ma_kv_latent_rescue_thr=0.08)
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Default World-State CR = future-use selector (P0+P1).
+# Default World-State CR = future-use selector + Memory Consolidation (v3).
 _WS_CKPT = os.getenv(
     "SELECTOR_CKPT",
     os.path.join(_ROOT, "assets", "selectors", "selector_ws_future_v1.pt"),
@@ -49,20 +49,47 @@ _HEURISTIC = dict(selector="heuristic")
 
 _BASE_MOCE = dict(local_attn_size=-1, sink_size=_SINK, **MA)
 _SWTP_KW = dict(enable_swtp=True, swtp_keep_ratio=0.5, swtp_num_summary=64,
-                swtp_min_saliency_gini=0.20, archive_diversity_pool=4)
+                swtp_min_saliency_gini=0.20, swtp_energy_cover=0.9,
+                archive_diversity_pool=4)
+_CONSOL_EMA = dict(consolidation="ema", consol_beta=0.7, consol_patience=2,
+                   consol_rank_alpha=0.0)
+_CONSOL_FULL = dict(consolidation="full", consol_beta=0.7, consol_patience=2,
+                    consol_gist_tokens=64, consol_gist_budget=512,
+                    consol_rank_alpha=0.5, consol_l2_bottom_ratio=0.5)
+# World-State CR versions:
+#   v1 = attention-mass selector (frozen ablation)
+#   v2 = future-use selector only (former default)
+#   v3 = v2 + Memory Consolidation full + SWTP  ← default
+_WS_V2 = dict(**_BASE_MOCE, **_WS)
+_WS_V3 = dict(**_BASE_MOCE, **_WS, **_SWTP_KW, **_CONSOL_FULL)
+
+def _v3(**kw):
+    d = dict(**_WS_V3)
+    d.update(kw)
+    return d
 
 METHODS = {
     "window": dict(local_attn_size=30, sink_size=_SINK),
     "heuristic_cr": dict(**_BASE_MOCE, **_HEURISTIC),
     "learned_cr": dict(**_BASE_MOCE, **_LEARNED),
-    # Default World-State CR (future-use / world_state.v2).
-    "world_state_cr": dict(**_BASE_MOCE, **_WS),
-    # Alias: former experimental name; same config as world_state_cr.
-    "world_state_cr_future": dict(**_BASE_MOCE, **_WS),
-    # Frozen ablation: attention-mass / world_state.v1.
+    # Default World-State CR = v3 (future-use v2 selector + consolidation).
+    # Tuned on default_loop: α=0.5, gist_tokens=64 (= ws_v3_a05_g64).
+    "world_state_cr": dict(**_WS_V3),
+    "world_state_cr_v3": dict(**_WS_V3),
+    # Back-compat / sweep-name aliases of the default.
+    "world_state_cr_future": dict(**_WS_V3),
+    "world_state_cr_consol": dict(**_WS_V3),
+    "ws_v3_a05_g64": dict(**_WS_V3),
+    # Frozen ablations.
     "world_state_cr_v1": dict(**_BASE_MOCE, **_WS_V1),
+    "world_state_cr_v2": dict(**_WS_V2),
+    "world_state_cr_ema": dict(**_BASE_MOCE, **_WS, **_CONSOL_EMA),
     "swtp": dict(local_attn_size=-1, sink_size=_SINK, **_SWTP_KW),
-    "mosaic": dict(**_BASE_MOCE, **_WS, **_SWTP_KW),  # World-State CR + SWTP
+    # Consolidation param sweep ablations (fixed L2 bottom-half trigger).
+    "ws_v3_a0": _v3(consol_rank_alpha=0.0, consol_gist_tokens=96),
+    "ws_v3_a05": _v3(consol_rank_alpha=0.5, consol_gist_tokens=96),
+    "ws_v3_a1": _v3(consol_rank_alpha=1.0, consol_gist_tokens=96),
+    "ws_v3_a05_g128": _v3(consol_rank_alpha=0.5, consol_gist_tokens=128),
 }
 
 _REALCAMVID = os.path.join(os.path.dirname(os.path.abspath(__file__)), "realcamvid")
@@ -102,7 +129,7 @@ def parse_args():
                     help="Official RealCam-Vid default test subset "
                          "(default_loop=24, default_random=40, default_all=64).")
     ap.add_argument("--out_dir", required=True, help="dir containing videos/ and stats/")
-    ap.add_argument("--methods", default="window,world_state_cr,mosaic")
+    ap.add_argument("--methods", default="window,world_state_cr")
     ap.add_argument("--frame_num", type=int, default=481)
     ap.add_argument("--base_seed", type=int, default=42)
     ap.add_argument("--ulysses_size", type=int, default=8)
@@ -148,6 +175,16 @@ def main():
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     if rank == 0:
         logging.info(f"shard={args.shard} clips={len(clips)} methods={methods} ulysses={args.ulysses_size}")
+        if len(methods) > 1:
+            # FSDP/NCCL teardown via `del pipe; empty_cache()` does not fully reclaim
+            # CUDA state; subsequent methods' peak_memory_allocated_gb is inflated by
+            # ~15–20GB (not an algorithm leak). Prefer one method per process
+            # (run_dp2.sh loops METHODS that way).
+            logging.warning(
+                "Multiple methods in one process: peak_memory after the first method "
+                "is NOT comparable (FSDP teardown residue). Use one --methods entry "
+                "per torchrun, or run_dp2.sh which launches each method fresh."
+            )
 
     for method in methods:
         if method not in METHODS:

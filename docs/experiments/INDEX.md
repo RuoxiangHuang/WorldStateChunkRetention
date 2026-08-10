@@ -1,6 +1,6 @@
 # Experiment index (paper-facing)
 
-Results retained for Chunk Retention / SWTP / MoSaiC.
+Results retained for Chunk Retention / SWTP / Consolidation.
 
 | Doc | Content |
 |-----|---------|

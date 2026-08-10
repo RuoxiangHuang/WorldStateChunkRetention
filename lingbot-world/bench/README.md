@@ -7,7 +7,7 @@ torchrun --nproc_per_node=8 batch_generate.py \
   --ckpt_dir "$CKPT_DIR" \
   --subset default_all \
   --out_dir output/realcamvid_default_all \
-  --methods window,heuristic_cr,learned_cr,world_state_cr,swtp,mosaic
+  --methods window,heuristic_cr,learned_cr,world_state_cr,swtp
 ```
 
 **Default RealCam-Vid test battery** (24 loop + 40 random = 64 clips):

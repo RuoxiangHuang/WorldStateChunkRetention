@@ -1,1 +1,0 @@
-lingbot-world/scripts/run_mosaic.sh

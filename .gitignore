@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# Git ignore for World-State CR / MoSaiC (LingBot-World fork)
+# Git ignore for World-State CR (LingBot-World fork)
 # Sole source tree: lingbot-world/
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -21,7 +21,6 @@ lingbot-world/assets/selectors/lora_*.pt
 lingbot-world/assets/selectors/lora_*_history.json
 
 # ── Generated / vendored trees (not the source of truth) ──
-# Portable zip is produced by tools/pack_mosaic.sh — do not edit this copy.
 lingbot-world-mosaic/
 lingbot-world-Quant/
 # Official WorldKV: clone into third_party/WorldKV (see third_party/README.md)
@@ -88,7 +87,7 @@ lingbot-world/bench/route_b/co-tracker/
 lingbot-world/bench/realcamvid/*.npz
 lingbot-world/LingBot_World_paper.pdf
 *.pdf
-!MoSaiC/**/*.pdf
+!paper/**/*.pdf
 
 # ── Python / caches ──
 __pycache__/

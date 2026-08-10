@@ -18,7 +18,8 @@ Default tier ratio (**1:1:2**): `sink_size=1`, `ma_kv_recent_window=1`, `ma_kv_m
 (from RealCam-Vid ratio sweep; `ma_kv_keep_ratio=0.5`).
 
 Ranking happens **after** the chunk is generated (post-generation retention).
-Dropped archive chunks are gone for the rest of the rollout.
+Dropped archive chunks are gone for the rest of the rollout (unless demoted
+into L1/L2 under Memory Consolidation — see below).
 
 ## Heuristic CR (`heuristic_cr`)
 
@@ -33,40 +34,46 @@ rescue (`max(camera_motion, latent_motion)`). No learned weights.
 
 Frozen baseline for ablations against World-State CR.
 
-## World-State CR (`world_state_cr`, default = former `world_state_cr_future`)
+## World-State CR (`world_state_cr`, default = **v3**)
 
-Default learned retention policy. Same Sink–Recent–Resident-Archive skeleton,
-with:
+Default retention policy. **v3 = v2 selector + Memory Consolidation (full)**,
+with default_loop-tuned knobs:
 
-- **P0 labels:** Future Coverage Oracle (`future_use_v1`) — discounted mix of
-  future attention mass and pose/frustum reuse over horizon `H` (default 8).
-- **P1 features:** schema `world_state.v2` with corrected
-  `reachability` / `relative_motion` / `time_since_last_observed` formulas.
+| Layer | What |
+|-------|------|
+| Selector (v2) | Future Coverage Oracle labels + `world_state.v2` features (`selector_ws_future_v1.pt`) |
+| Ranking | `α·s + (1-α)·u_ema` with **α=0.5** |
+| Consolidation C2 | L0→L1(SWTP)→L2(gist)→L3; demote bottom half of kept to L2 |
+| L2 gist | **`consol_gist_tokens=64`** (sweep winner `ws_v3_a05_g64`) |
+| SWTP | Required for L1/L2; spatial-cell summaries + energy-cover keep |
 
-Checkpoint: `selector_ws_future_v1.pt`.  
-`world_state_cr_future` remains a **back-compat alias** of `world_state_cr`.
+Aliases of the default: `world_state_cr_v3`, `world_state_cr_consol`,
+`world_state_cr_future`, `ws_v3_a05_g64`.
 
 ```bash
-python train_selector.py --label_type future_use_v1 --feature_schema v2 \
-  --oracle path/to/oracle_dense_*.pt \
-  --out assets/selectors/selector_ws_future_v1.pt
-
 python generate_fast.py ... --memory_policy world_state_cr
+# equivalent aliases: world_state_cr_v3 / world_state_cr_consol / ws_v3_a05_g64
 ```
 
-## World-State CR v1 ablation (`world_state_cr_v1`)
+## Ablations
 
-Frozen attention-mass selector (`selector_ws_v1.pt`, schema `world_state.v1`)
-with SE(3) geometry / frustum features. Kept only for ablations against the
-default future-use World-State CR.
+| Policy / method | Meaning |
+|-----------------|--------|
+| `world_state_cr_v2` | Former default: future-use selector only (no consol / no SWTP) |
+| `world_state_cr_v1` | Attention-mass selector (`selector_ws_v1.pt`, schema `world_state.v1`) |
+| `world_state_cr_ema` | v2 + EMA ranking only (no L1/L2 compression) |
+| `swtp` | SWTP without CR |
+
+See [`MEMORY_CONSOLIDATION.md`](MEMORY_CONSOLIDATION.md) and [`SWTP.md`](SWTP.md).
 
 ## CLI
 
 ```bash
 python generate_fast.py ... --memory_policy heuristic_cr
 python generate_fast.py ... --memory_policy learned_cr
-python generate_fast.py ... --memory_policy world_state_cr
-python generate_fast.py ... --memory_policy world_state_cr_v1
+python generate_fast.py ... --memory_policy world_state_cr      # v3 default
+python generate_fast.py ... --memory_policy world_state_cr_v2   # selector-only
+python generate_fast.py ... --memory_policy world_state_cr_v1   # attn-mass
 ```
 
 Baseline without CR: `--memory_policy window` (sliding local attention).

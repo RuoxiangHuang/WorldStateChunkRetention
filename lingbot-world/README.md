@@ -1,10 +1,10 @@
 # lingbot-world (sole source tree)
 
-Inference runtime for **World-State Chunk Retention** (and optional MoSaiC)
-on LingBot-World-Fast. Edit code **here only** — do not maintain a parallel
-copy under `lingbot-world-mosaic/`.
+Inference runtime for **World-State Chunk Retention** on LingBot-World-Fast.
+Edit code **here only**.
 
-Parent overview: [`../README.md`](../README.md).
+Parent overview: [`../README.md`](../README.md).  
+Paper LaTeX: [`../paper/`](../paper/).
 
 ## Methods
 
@@ -13,12 +13,10 @@ Parent overview: [`../README.md`](../README.md).
 | `window` | Sliding-window baseline |
 | `heuristic_cr` | Motion-score CR |
 | `learned_cr` | 5-D ChunkSelector (`assets/selectors/selector_all4.pt`) |
-| `world_state_cr` | **Default** future-use 11-D (`selector_ws_future_v1.pt`) |
+| `world_state_cr` | **Default v3**: future-use selector + consolidation + SWTP |
+| `world_state_cr_v2` | Selector only (former default) |
 | `world_state_cr_v1` | Attention-mass ablation (`selector_ws_v1.pt`) |
-| `world_state_cr_future` | Alias of `world_state_cr` |
-
-Orthogonal: `--enable_swtp` for token pruning.  
-**MoSaiC** = `world_state_cr` + `--enable_swtp`.
+| `world_state_cr_future` / `_v3` / `_consol` | Aliases of `world_state_cr` |
 
 ## Entry points
 
@@ -27,9 +25,8 @@ Orthogonal: `--enable_swtp` for token pruning.
 | `scripts/run_window.sh` | Sliding window |
 | `scripts/run_heuristic_cr.sh` | Heuristic CR |
 | `scripts/run_learned_cr.sh` | Learned CR |
-| `scripts/run_world_state_cr.sh` | World-State CR (default) |
+| `scripts/run_world_state_cr.sh` | World-State CR v3 (default) |
 | `scripts/run_swtp.sh` | SWTP only |
-| `scripts/run_mosaic.sh` | MoSaiC |
 
 Batch: `bench/batch_generate.py`  
 Eval: `bench/eval_worldkv_memory.py` / `bench/realcamvid/run_worldkv_eval.sh`  
@@ -38,35 +35,12 @@ WorldKV baseline: `bench/worldkv/` + `bench/realcamvid/run_worldkv_official.sh`
 ## Layout
 
 ```
-generate_fast.py          CLI + --memory_policy mapping
+generate_fast.py          CLI
 train_selector.py         ChunkSelector training
-wan/image2video_fast.py   CR eviction + SWTP
-wan/modules/chunk_selector.py
-wan/utils/selector_defaults.py
-wan/utils/future_use_labels.py
-assets/selectors/*.pt
-examples/00–05
-bench/realcamvid/         default_loop / default_random / default_all
+wan/                      model + CR / SWTP / consolidation
+assets/selectors/         tracked .pt checkpoints
+examples/                 demo clips
+scripts/                  run_*.sh
+bench/                    RealCam-Vid + WorldKV
 tests/
-```
-
-## Assets
-
-```
-assets/selectors/selector_ws_future_v1.pt   # World-State CR (default)
-assets/selectors/selector_ws_v1.pt          # v1 ablation
-assets/selectors/selector_all4.pt           # Learned CR
-```
-
-## Tests
-
-```bash
-python -m pytest tests/ -q
-```
-
-## Environment
-
-```bash
-source ../env.sh   # from repo root
-# requires CKPT_DIR → LingBot-World-Fast checkpoint
 ```
