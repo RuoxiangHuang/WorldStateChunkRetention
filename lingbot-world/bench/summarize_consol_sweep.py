@@ -22,19 +22,16 @@ def main():
         name = os.path.basename(p)[:-5]  # strip .json
         # clip_method: method may contain underscores; match known suffixes
         method = None
-        for m in sorted(
-            [
-                "world_state_cr_v2",
-                "ws_v3_a05_g128",
-                "ws_v3_a05_g64",
-                "ws_v3_a05",
-                "ws_v3_a0",
-                "ws_v3_a1",
-                "world_state_cr",
-            ],
-            key=len,
-            reverse=True,
-        ):
+        # Longest-suffix match so names like ws_v3_a05_g64 beat ws_v3_a05.
+        known = [
+            "world_state_cr_v2", "world_state_cr",
+            "ws_v3_a05_g128", "ws_v3_a05_g64",
+            "ws_v3_a05", "ws_v3_a0", "ws_v3_a1",
+            "ws_v3_l25", "ws_v3_l75",
+            "ws_v3_g32", "ws_v3_g48", "ws_v3_g80",
+            "ws_v3_b05", "ws_v3_b09",
+        ]
+        for m in sorted(known, key=len, reverse=True):
             if name.endswith("_" + m):
                 method = m
                 break

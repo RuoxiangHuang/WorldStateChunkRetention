@@ -90,6 +90,17 @@ METHODS = {
     "ws_v3_a05": _v3(consol_rank_alpha=0.5, consol_gist_tokens=96),
     "ws_v3_a1": _v3(consol_rank_alpha=1.0, consol_gist_tokens=96),
     "ws_v3_a05_g128": _v3(consol_rank_alpha=0.5, consol_gist_tokens=128),
+    # Phase-2: knobs never swept in default_loop (anchor = ws_v3_a05_g64).
+    # L2 demotion intensity (prev. fixed at 0.5).
+    "ws_v3_l25": _v3(consol_l2_bottom_ratio=0.25),
+    "ws_v3_l75": _v3(consol_l2_bottom_ratio=0.75),
+    # Gist size around winner 64.
+    "ws_v3_g32": _v3(consol_gist_tokens=32),
+    "ws_v3_g48": _v3(consol_gist_tokens=48),
+    "ws_v3_g80": _v3(consol_gist_tokens=80),
+    # EMA β (prev. fixed at 0.7).
+    "ws_v3_b05": _v3(consol_beta=0.5),
+    "ws_v3_b09": _v3(consol_beta=0.9),
 }
 
 _REALCAMVID = os.path.join(os.path.dirname(os.path.abspath(__file__)), "realcamvid")

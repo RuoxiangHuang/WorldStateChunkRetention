@@ -120,6 +120,9 @@ class TestBatchGenerateMethodNames(unittest.TestCase):
             "world_state_cr_v1", "world_state_cr_v2", "world_state_cr_ema",
             "swtp",
             "ws_v3_a0", "ws_v3_a05", "ws_v3_a1", "ws_v3_a05_g128",
+            "ws_v3_l25", "ws_v3_l75",
+            "ws_v3_g32", "ws_v3_g48", "ws_v3_g80",
+            "ws_v3_b05", "ws_v3_b09",
         }
         self.assertEqual(set(mod.METHODS), expected)
         # Default world_state_cr is v3 = future-use ckpt + consol full + SWTP
