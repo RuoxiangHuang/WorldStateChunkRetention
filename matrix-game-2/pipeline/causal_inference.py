@@ -29,118 +29,16 @@ def _cr_observe(pipeline, start_frame, num_frames, conditional_dict):
         )
 
 
-def _rope_finish_block(pipeline, e2e=None) -> None:
-    rope = getattr(getattr(pipeline, "generator", None), "model", None)
-    rope = getattr(rope, "causal_rope", None) if rope is not None else None
-    if rope is None or not getattr(rope, "profile", False):
-        return
-    ms = rope.finish_block()
-    if e2e is not None and e2e.enabled and ms is not None:
-        e2e.time_ms.setdefault("rope", []).append(float(ms))
-
-
-def _gemm_finish_block(pipeline, e2e=None) -> None:
-    model = getattr(getattr(pipeline, "generator", None), "model", None)
-    timer = getattr(model, "gemm_timer", None) if model is not None else None
-    if timer is None or not getattr(timer, "enabled", False):
-        return
-    parts = timer.finish_block()
-    if e2e is not None and e2e.enabled:
-        e2e.time_ms.setdefault("attn", []).append(float(parts.get("attn", 0.0)))
-        e2e.time_ms.setdefault("ffn", []).append(float(parts.get("ffn", 0.0)))
-
-
-def _rope_summary(pipeline) -> None:
-    rope = getattr(getattr(pipeline, "generator", None), "model", None)
-    rope = getattr(rope, "causal_rope", None) if rope is not None else None
-    e2e = getattr(pipeline, "e2e", None)
-    want = (rope is not None and getattr(rope, "profile", False)) or (
-        e2e is not None and e2e.enabled
-    )
-    if not want:
-        return
-    if rope is not None and getattr(rope, "profile", False):
-        print(f"[ROPE] {rope.summary()}", flush=True)
-    timer = getattr(getattr(pipeline, "generator", None), "model", None)
-    timer = getattr(timer, "gemm_timer", None) if timer is not None else None
-    if timer is not None and getattr(timer, "enabled", False):
-        print(f"[FFN] {timer.summary()}", flush=True)
-    if torch.cuda.is_available():
-        peak = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
-        print(f"[DIT] peak_mem_mib={peak:.1f}", flush=True)
-
-
-def _tich_configure(pipeline, conditional_dict=None, rollout_id=0):
-    from wan.memory.cond_hoist import TICHState, attach_tich
-    enabled = bool(getattr(pipeline, "cond_hoist_enabled", False))
-    profile = bool(getattr(getattr(pipeline, "args", None), "cond_hoist_profile", False))
-    state = TICHState(enabled=enabled, profile=profile, assert_counts=enabled)
-    pipeline.tich = state
-    attach_tich(pipeline.generator.model, state)
-    if enabled:
-        state.begin_rollout(int(rollout_id))
-        vis = None if not isinstance(conditional_dict, dict) else conditional_dict.get("visual_context")
-        if vis is not None:
-            state.precompute_img_emb(pipeline.generator.model, vis)
+def _cr_attach(pipeline, args):
+    from wan.memory.kv_retention import attach_planner, build_planner
+    pipeline.kv_retention = build_planner(args)
+    if pipeline.kv_retention.enabled:
+        attach_planner(pipeline.generator.model, pipeline.kv_retention)
         print(
-            "[TICH] enable_cond_hoist=True instance=TICHState "
-            f"profile={profile} conv_split=True img_emb=True",
+            f"[CR] memory_policy={pipeline.kv_retention.policy} "
+            f"sink={pipeline.kv_retention.sink_frames} recent={pipeline.kv_retention.recent_frames}",
             flush=True,
         )
-
-
-def _tich_begin(pipeline, block_id, block_cond=None):
-    state = getattr(pipeline, "tich", None)
-    if state is None or not state.enabled:
-        return
-    if state.profile:
-        state._block_t0 = time.perf_counter()
-        if torch.cuda.is_available():
-            ev = torch.cuda.Event(enable_timing=True)
-            ev.record()
-            state._block_ev0 = ev
-        else:
-            state._block_ev0 = None
-    cond = block_cond.get("cond_concat") if isinstance(block_cond, dict) else None
-    state.begin_block(
-        block_id,
-        model=pipeline.generator.model,
-        cond_concat=cond,
-    )
-
-
-def _tich_end(pipeline, expected_forwards=None):
-    state = getattr(pipeline, "tich", None)
-    if state is None or not state.enabled:
-        return
-    if state.profile:
-        if torch.cuda.is_available() and getattr(state, "_block_ev0", None) is not None:
-            ev1 = torch.cuda.Event(enable_timing=True)
-            ev1.record()
-            ev1.synchronize()
-            state.time_ms["block"].append(float(state._block_ev0.elapsed_time(ev1)))
-        else:
-            t0 = float(getattr(state, "_block_t0", time.perf_counter()))
-            state.time_ms["block"].append((time.perf_counter() - t0) * 1000.0)
-    if expected_forwards is None:
-        expected_forwards = int(len(getattr(pipeline, "denoising_step_list", [])) + 1)
-    state.end_block(expected_forwards=int(expected_forwards))
-
-
-def _tich_summary(pipeline):
-    state = getattr(pipeline, "tich", None)
-    if state is None or not state.enabled:
-        return
-    state.end_rollout()
-    print(f"[TICH] {state.summary()}", flush=True)
-
-
-def _tich_generate(pipeline, **kwargs):
-    state = getattr(pipeline, "tich", None)
-    if state is not None and state.enabled and state.profile:
-        return state.timed("denoise", lambda: pipeline.generator(**kwargs))
-    return pipeline.generator(**kwargs)
-
 
 def get_current_action(mode="universal"):
 
@@ -298,33 +196,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
-
-        from wan.memory.kv_retention import attach_planner, build_planner
-        self.kv_retention = build_planner(args)
-        if self.kv_retention.enabled:
-            attach_planner(self.generator.model, self.kv_retention)
-            print(
-                f"[CR] memory_policy={self.kv_retention.policy} "
-                f"sink={self.kv_retention.sink_frames} recent={self.kv_retention.recent_frames}",
-                flush=True,
-            )
-        self.cond_hoist_enabled = bool(getattr(args, "enable_cond_hoist", False))
-        from demo_utils.e2e_profile import E2EProfile
-        self.e2e = E2EProfile(enabled=bool(getattr(args, "e2e_profile", False)))
-        if self.e2e.enabled:
-            print("[E2E] per-block CUDA-event split dit/vae/other", flush=True)
-        from wan.modules.causal_rope import attach_causal_rope
-        attach_causal_rope(
-            self.generator.model,
-            mode=str(getattr(args, "rope_mode", "fp64")),
-            profile=bool(getattr(args, "dit_profile", False)),
-        )
-        from wan.modules.ffn_gemm import attach_gemm_timer
-        attach_gemm_timer(
-            self.generator.model,
-            enabled=bool(getattr(args, "dit_profile", False)),
-        )
-        self.dump_latents = str(getattr(args, "dump_latents", "") or "")
+        _cr_attach(self, args)
 
     def inference(
         self,
@@ -373,14 +245,6 @@ class CausalInferencePipeline(torch.nn.Module):
 
         self.kv_cache1 = self.kv_cache_keyboard = self.kv_cache_mouse = self.crossattn_cache=None
         _cr_reset(self)
-        _tich_configure(self, conditional_dict)
-        dumped_blocks = [] if self.dump_latents else None
-        e2e_or_rope = bool(getattr(self, "e2e", None) and self.e2e.enabled)
-        _rope = getattr(self.generator.model, "causal_rope", None)
-        if _rope is not None and _rope.profile:
-            e2e_or_rope = True
-        if torch.cuda.is_available() and e2e_or_rope:
-            torch.cuda.reset_peak_memory_stats()
         # Step 1: Initialize KV cache to all zeros
         if self.kv_cache1 is None:
             self._initialize_kv_cache(
@@ -429,14 +293,10 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_ref_latents = \
                     initial_latent[:, :, current_start_frame:current_start_frame + self.num_frame_per_block]
                 output[:, :, current_start_frame:current_start_frame + self.num_frame_per_block] = current_ref_latents
-                block_cond = cond_current(
-                    conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode)
-                _cr_observe(self, current_start_frame, self.num_frame_per_block, conditional_dict)
-                _tich_begin(self, current_start_frame, block_cond)
-                _tich_generate(
-                    self,
+                
+                self.generator(
                     noisy_image_or_video=current_ref_latents,
-                    conditional_dict=block_cond,
+                    conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode),
                     timestep=timestep * 0,
                     kv_cache=self.kv_cache1,
                     kv_cache_mouse=self.kv_cache_mouse,
@@ -444,7 +304,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                 )
-                _tich_end(self, expected_forwards=1)
+                _cr_observe(self, current_start_frame, self.num_frame_per_block, conditional_dict)
                 current_start_frame += self.num_frame_per_block
 
 
@@ -457,19 +317,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
             noisy_input = noise[
                 :, :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
-            block_cond = cond_current(
-                conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode)
             _cr_observe(self, current_start_frame, current_num_frames, conditional_dict)
-            _tich_begin(self, current_start_frame, block_cond)
-
-            e2e = getattr(self, "e2e", None)
-            e2e_on = e2e is not None and e2e.enabled
-            if e2e_on and torch.cuda.is_available():
-                _eb0 = torch.cuda.Event(enable_timing=True)
-                _eb0.record()
-                _ed0 = _eb0
-            elif e2e_on:
-                _eb0 = time.perf_counter()
 
             # Step 3.1: Spatial denoising loop
             if profile:
@@ -483,10 +331,9 @@ class CausalInferencePipeline(torch.nn.Module):
                     dtype=torch.int64) * current_timestep
 
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = _tich_generate(
-                        self,
+                    _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=block_cond,
+                        conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode),
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         kv_cache_mouse=self.kv_cache_mouse,
@@ -504,10 +351,9 @@ class CausalInferencePipeline(torch.nn.Module):
                     noisy_input = rearrange(noisy_input, '(b f) c h w -> b c f h w', b=denoised_pred.shape[0])
                 else:
                     # for getting real output
-                    _, denoised_pred = _tich_generate(
-                        self,
+                    _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=block_cond,
+                        conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode),
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         kv_cache_mouse=self.kv_cache_mouse,
@@ -518,16 +364,13 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.2: record the model's output
             output[:, :, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
-            if dumped_blocks is not None:
-                dumped_blocks.append(denoised_pred.detach().float().cpu())
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             
-            _tich_generate(
-                self,
+            self.generator(
                 noisy_image_or_video=denoised_pred,
-                conditional_dict=block_cond,
+                conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode),
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 kv_cache_mouse=self.kv_cache_mouse,
@@ -535,39 +378,13 @@ class CausalInferencePipeline(torch.nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
             )
-            _tich_end(self)
-
-            if e2e_on and torch.cuda.is_available():
-                _ed1 = torch.cuda.Event(enable_timing=True)
-                _ed1.record()
-            elif e2e_on:
-                _ed1_cpu = time.perf_counter()
-            _rope_finish_block(self, e2e if e2e_on else None)
-            _gemm_finish_block(self, e2e if e2e_on else None)
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
 
             denoised_pred = denoised_pred.transpose(1,2)
-            if e2e_on:
-                video, vae_cache = e2e.timed(
-                    "vae",
-                    lambda: self.vae_decoder(denoised_pred.half(), *vae_cache),
-                )
-            else:
-                video, vae_cache = self.vae_decoder(denoised_pred.half(), *vae_cache)
+            video, vae_cache = self.vae_decoder(denoised_pred.half(), *vae_cache)
             videos += [video]
-            if e2e_on:
-                if torch.cuda.is_available():
-                    _eb1 = torch.cuda.Event(enable_timing=True)
-                    _eb1.record()
-                    _eb1.synchronize()
-                    e2e.time_ms["dit"].append(float(_ed0.elapsed_time(_ed1)))
-                    e2e.time_ms["block"].append(float(_eb0.elapsed_time(_eb1)))
-                else:
-                    e2e.time_ms["dit"].append((_ed1_cpu - _eb0) * 1000.0)
-                    e2e.time_ms["block"].append((time.perf_counter() - _eb0) * 1000.0)
-                e2e.finish_block()
 
             if profile:
                 torch.cuda.synchronize()
@@ -579,19 +396,6 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if getattr(self, "kv_retention", None) is not None and self.kv_retention.enabled:
             print(f"[CR] {self.kv_retention.summary()}", flush=True)
-        _tich_summary(self)
-        if getattr(self, "e2e", None) is not None and self.e2e.enabled:
-            print(f"[E2E] {self.e2e.summary()}", flush=True)
-        _rope_summary(self)
-        if self.dump_latents:
-            torch.save(
-                {
-                    "blocks": dumped_blocks,
-                    "output": output.detach().float().cpu(),
-                },
-                self.dump_latents,
-            )
-            print(f"[DIT] dumped latents {self.dump_latents}", flush=True)
         if return_latents:
             return output
         else:
@@ -698,33 +502,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
-
-        from wan.memory.kv_retention import attach_planner, build_planner
-        self.kv_retention = build_planner(args)
-        if self.kv_retention.enabled:
-            attach_planner(self.generator.model, self.kv_retention)
-            print(
-                f"[CR] memory_policy={self.kv_retention.policy} "
-                f"sink={self.kv_retention.sink_frames} recent={self.kv_retention.recent_frames}",
-                flush=True,
-            )
-        self.cond_hoist_enabled = bool(getattr(args, "enable_cond_hoist", False))
-        from demo_utils.e2e_profile import E2EProfile
-        self.e2e = E2EProfile(enabled=bool(getattr(args, "e2e_profile", False)))
-        if self.e2e.enabled:
-            print("[E2E] per-block CUDA-event split dit/vae/other", flush=True)
-        from wan.modules.causal_rope import attach_causal_rope
-        attach_causal_rope(
-            self.generator.model,
-            mode=str(getattr(args, "rope_mode", "fp64")),
-            profile=bool(getattr(args, "dit_profile", False)),
-        )
-        from wan.modules.ffn_gemm import attach_gemm_timer
-        attach_gemm_timer(
-            self.generator.model,
-            enabled=bool(getattr(args, "dit_profile", False)),
-        )
-        self.dump_latents = str(getattr(args, "dump_latents", "") or "")
+        _cr_attach(self, args)
 
     def inference(
         self,
@@ -774,7 +552,6 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
         # Set up profiling if requested
         self.kv_cache1=self.kv_cache_keyboard=self.kv_cache_mouse=self.crossattn_cache=None
         _cr_reset(self)
-        _tich_configure(self, conditional_dict)
         # Step 1: Initialize KV cache to all zeros
         if self.kv_cache1 is None:
             self._initialize_kv_cache(
@@ -824,14 +601,9 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                 current_ref_latents = \
                     initial_latent[:, :, current_start_frame:current_start_frame + self.num_frame_per_block]
                 output[:, :, current_start_frame:current_start_frame + self.num_frame_per_block] = current_ref_latents
-                block_cond = cond_current(
-                    conditional_dict, current_start_frame, self.num_frame_per_block, replace=True)
-                _cr_observe(self, current_start_frame, self.num_frame_per_block, conditional_dict)
-                _tich_begin(self, current_start_frame, block_cond)
-                _tich_generate(
-                    self,
+                self.generator(
                     noisy_image_or_video=current_ref_latents,
-                    conditional_dict=block_cond,
+                    conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, replace=True),
                     timestep=timestep * 0,
                     kv_cache=self.kv_cache1,
                     kv_cache_mouse=self.kv_cache_mouse,
@@ -839,7 +611,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                 )
-                _tich_end(self, expected_forwards=1)
+                _cr_observe(self, current_start_frame, self.num_frame_per_block, conditional_dict)
                 current_start_frame += self.num_frame_per_block
 
         # Step 3: Temporal denoising loop
@@ -852,7 +624,6 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             current_actions = get_current_action(mode=mode)
             new_act, conditional_dict = cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, replace=current_actions, mode=mode)
             _cr_observe(self, current_start_frame, current_num_frames, new_act)
-            _tich_begin(self, current_start_frame, new_act)
             # Step 3.1: Spatial denoising loop
 
             for index, current_timestep in enumerate(self.denoising_step_list):
@@ -863,8 +634,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                     dtype=torch.int64) * current_timestep
 
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = _tich_generate(
-                        self,
+                    _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=new_act,
                         timestep=timestep,
@@ -884,8 +654,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                     noisy_input = rearrange(noisy_input, '(b f) c h w -> b c f h w', b=denoised_pred.shape[0])
                 else:
                     # for getting real output
-                    _, denoised_pred = _tich_generate(
-                        self,
+                    _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=new_act,
                         timestep=timestep,
@@ -902,8 +671,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             
-            _tich_generate(
-                self,
+            self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=new_act,
                 timestep=context_timestep,
@@ -913,7 +681,6 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
             )
-            _tich_end(self)
 
             # Step 3.4: update the start and end frame indices
             denoised_pred = denoised_pred.transpose(1,2)
@@ -957,10 +724,6 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
 
         if getattr(self, "kv_retention", None) is not None and self.kv_retention.enabled:
             print(f"[CR] {self.kv_retention.summary()}", flush=True)
-        _tich_summary(self)
-        if getattr(self, "e2e", None) is not None and self.e2e.enabled:
-            print(f"[E2E] {self.e2e.summary()}", flush=True)
-
         if return_latents:
             return output
         else:

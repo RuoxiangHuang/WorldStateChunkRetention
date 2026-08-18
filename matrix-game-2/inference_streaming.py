@@ -10,7 +10,7 @@ from diffusers.utils import load_image
 
 from pipeline import CausalInferenceStreamingPipeline
 from wan.vae.wanx_vae import get_wanx_vae_wrapper
-from demo_utils.vae_block3 import VAEDecoderWrapper, configure_vae_decoder
+from demo_utils.vae_block3 import VAEDecoderWrapper
 from utils.visualize import process_video
 from utils.misc import set_seed
 from utils.conditions import *
@@ -27,31 +27,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--pretrained_model_path", type=str, default="Matrix-Game-2.0", help="Path to the VAE model folder")
     parser.add_argument("--memory-policy", type=str, default="window",
-                        choices=["window", "world_state_cr"])
+                        choices=["window", "world_state_cr"],
+                        help="window=official FIFO KV; world_state_cr=sink+ranked archive")
     parser.add_argument("--cr-sink-frames", type=int, default=1)
     parser.add_argument("--cr-recent-frames", type=int, default=1)
     parser.add_argument("--cr-keep-ratio", type=float, default=0.5)
     parser.add_argument("--cr-min-keep", type=int, default=2)
-    parser.add_argument("--enable-cond-hoist", action="store_true",
-                        help="TICH: hoist timestep-invariant Conv3d/CLIP. Default off.")
-    parser.add_argument("--cond-hoist-profile", action="store_true",
-                        help="CUDA-event breakdown: conv_c/conv_x/conv_full/img_emb/denoise/block/rollout")
-    parser.add_argument("--e2e-profile", action="store_true",
-                        help="Per-block CUDA-event split: DiT vs VAE vs leftover")
-    parser.add_argument("--compile-vae", action="store_true",
-                        help="A of VAE 2x2: torch.compile(max-autotune-no-cudagraphs) on the decoder.")
-    parser.add_argument("--vae-legacy", action="store_true",
-                        help="A/B: growing torch.cat + cache assignment. Default C is prealloc/copy_.")
-    parser.add_argument("--rope-mode", type=str, default="fp64",
-                        choices=["fp64", "fp32", "fp32_fused"],
-                        help="Causal self-attn RoPE: fp64=original B0; fp32; fp32_fused=cached freqs_i.")
-    parser.add_argument("--dit-profile", action="store_true",
-                        help="CUDA-event RoPE time per temporal block (use with --e2e-profile).")
-    parser.add_argument("--dump-latents", type=str, default="",
-                        help="Save per-block denoised latents to this .pt for B0/B1 compare.")
-    parser.add_argument("--ffn-mode", type=str, default="bf16",
-                        choices=["bf16", "fp8", "compile"],
-                        help="FFN GEMM: bf16=current; fp8=W8A8 torch._scaled_mm; compile=reduce-overhead on FFN only.")
     args = parser.parse_args()
     return args
 
@@ -77,15 +58,6 @@ class InteractiveGameInference:
         self.config.cr_recent_frames = self.args.cr_recent_frames
         self.config.cr_keep_ratio = self.args.cr_keep_ratio
         self.config.cr_min_keep = self.args.cr_min_keep
-        self.config.enable_cond_hoist = self.args.enable_cond_hoist
-        self.config.cond_hoist_profile = self.args.cond_hoist_profile
-        self.config.e2e_profile = self.args.e2e_profile
-        self.config.compile_vae = self.args.compile_vae
-        self.config.vae_legacy = self.args.vae_legacy
-        self.config.rope_mode = self.args.rope_mode
-        self.config.dit_profile = self.args.dit_profile
-        self.config.dump_latents = self.args.dump_latents
-        self.config.ffn_mode = self.args.ffn_mode
 
     def _init_models(self):
         # Initialize pipeline
@@ -101,11 +73,7 @@ class InteractiveGameInference:
         current_vae_decoder.to(self.device, torch.float16)
         current_vae_decoder.requires_grad_(False)
         current_vae_decoder.eval()
-        configure_vae_decoder(
-            current_vae_decoder,
-            legacy=bool(self.args.vae_legacy),
-            compile_vae=bool(self.args.compile_vae),
-        )
+        current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
         pipeline = CausalInferenceStreamingPipeline(self.config, generator=generator, vae_decoder=current_vae_decoder)
         if self.args.checkpoint_path:
             print("Loading Pretrained Model...")
@@ -114,8 +82,6 @@ class InteractiveGameInference:
 
         self.pipeline = pipeline.to(device=self.device, dtype=self.weight_dtype)
         self.pipeline.vae_decoder.to(torch.float16)
-        from wan.modules.ffn_gemm import configure_ffn
-        configure_ffn(self.pipeline.generator.model, mode=str(self.args.ffn_mode))
 
         vae = get_wanx_vae_wrapper(self.args.pretrained_model_path, torch.float16)
         vae.requires_grad_(False)

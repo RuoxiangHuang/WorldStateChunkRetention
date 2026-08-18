@@ -4,12 +4,6 @@ import torch
 import torch.nn as nn
 
 from wan.modules.vae import AttentionBlock, CausalConv3d, RMS_norm, ResidualBlock, Upsample
-from wan.modules.vae_cache import (
-    feat_cache_ready,
-    join_time,
-    set_vae_prealloc,
-    store_feat_cache,
-)
 
 
 class Resample(nn.Module):
@@ -78,7 +72,7 @@ class Resample(nn.Module):
                         x = self.time_conv(x)
                     else:
                         x = self.time_conv(x, feat_cache[idx])
-                    store_feat_cache(feat_cache, idx, cache_x)
+                    feat_cache[idx] = cache_x
                     feat_idx[0] += 1
 
                     x = x.reshape(b, 2, c, t, h, w)
@@ -105,7 +99,7 @@ class Resample(nn.Module):
 
                     x = self.time_conv(
                         torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
-                    store_feat_cache(feat_cache, idx, cache_x)
+                    feat_cache[idx] = cache_x
                     feat_idx[0] += 1
         return x
 
@@ -149,62 +143,6 @@ class VAEDecoderWrapper(nn.Module):
         self.std = torch.tensor(std, dtype=torch.float32)
         self.z_dim = 16
         self.conv2 = CausalConv3d(self.z_dim, self.z_dim, 1)
-        # Graph is a no-go: no steady-state win, and replay used to return the
-        # same ``_g_out`` buffer while ``forward`` appended aliases into
-        # ``pieces``. CLI no longer exposes it. Clone remains if re-enabled.
-        self.use_cuda_graph = False
-        self.use_prealloc = True
-        self._g = None
-        self._g_in = None
-        self._g_out = None
-        self._g_warm = False
-        self._g_failed = False
-        self._scale = None
-
-    def reset_cuda_graph(self):
-        self._g = None
-        self._g_in = None
-        self._g_out = None
-        self._g_warm = False
-        self._g_failed = False
-
-    def _decode_frame(self, x1: torch.Tensor, feat_cache):
-        want_graph = (
-            self.use_cuda_graph
-            and (not self._g_failed)
-            and x1.is_cuda
-            and feat_cache_ready(feat_cache)
-        )
-        if not want_graph:
-            return self.decoder(x1, feat_cache=feat_cache)
-        if not self._g_warm:
-            # One eager frame with a fully allocated cache so capture does not
-            # allocate. This frame is still a real decode.
-            self._g_warm = True
-            return self.decoder(x1, feat_cache=feat_cache)
-        if self._g is None:
-            self._g_in = x1.clone()
-            try:
-                torch.cuda.synchronize()
-                self._g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self._g):
-                    self._g_out, feat_cache = self.decoder(
-                        self._g_in, feat_cache=feat_cache)
-            except Exception as e:
-                print(
-                    f"[VAE] CUDA graph capture failed ({e}); "
-                    "falling back to eager decode",
-                    flush=True,
-                )
-                self._g = None
-                self._g_failed = True
-                self.use_cuda_graph = False
-                return self.decoder(x1, feat_cache=feat_cache)
-            # Independent storage: callers append this into ``pieces``.
-            return self._g_out.clone(), feat_cache
-        self._g_in.copy_(x1)
-        self._g.replay()
-        return self._g_out.clone(), feat_cache
 
     def forward(
             self,
@@ -215,54 +153,35 @@ class VAEDecoderWrapper(nn.Module):
         # to [batch_size, num_channels, num_frames, height, width]
         z = z.permute(0, 2, 1, 3, 4)
         feat_cache = list(feat_cache)
+        # print("Length of feat_cache: ", len(feat_cache))
 
         device, dtype = z.device, z.dtype
-        if (
-            self._scale is None
-            or self._scale[0].device != device
-            or self._scale[0].dtype != dtype
-        ):
-            self._scale = (
-                self.mean.to(device=device, dtype=dtype),
-                (1.0 / self.std).to(device=device, dtype=dtype),
-            )
-        z = z / self._scale[1].view(1, self.z_dim, 1, 1, 1) + self._scale[0].view(
-            1, self.z_dim, 1, 1, 1)
+        scale = [self.mean.to(device=device, dtype=dtype),
+                 1.0 / self.std.to(device=device, dtype=dtype)]
+
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
-        if self.use_prealloc:
-            pieces = []
-            for i in range(iter_):
-                piece, feat_cache = self._decode_frame(
-                    x[:, :, i:i + 1, :, :], feat_cache)
-                pieces.append(piece)
-            out = join_time(pieces)
-        else:
-            out = None
-            for i in range(iter_):
-                piece, feat_cache = self._decode_frame(
-                    x[:, :, i:i + 1, :, :], feat_cache)
-                out = piece if out is None else torch.cat([out, piece], 2)
+        for i in range(iter_):
+            if i == 0:
+                out, feat_cache = self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=feat_cache)
+            else:
+                out_, feat_cache = self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=feat_cache)
+                out = torch.cat([out, out_], 2)
+
         out = out.float().clamp_(-1, 1)
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]
         out = out.permute(0, 2, 1, 3, 4)
         return out, feat_cache
-
-
-def configure_vae_decoder(decoder, *, legacy: bool = False, compile_vae: bool = False):
-    """A/B/C stream config. CUDA Graph is not a CLI option."""
-    decoder.use_cuda_graph = False
-    decoder.use_prealloc = not legacy
-    set_vae_prealloc(not legacy)
-    if compile_vae:
-        decoder.compile(mode="max-autotune-no-cudagraphs")
-    kind = "legacy" if legacy else "prealloc"
-    print(
-        f"[VAE] stream_opt={kind} compile={bool(compile_vae)} cuda_graph=disabled",
-        flush=True,
-    )
-    return decoder
 
 
 class VAEDecoder3d(nn.Module):
@@ -338,7 +257,7 @@ class VAEDecoder3d(nn.Module):
             ],
                 dim=2)
         x = self.conv1(x, feat_cache[idx])
-        store_feat_cache(feat_cache, idx, cache_x)
+        feat_cache[idx] = cache_x
         feat_idx[0] += 1
 
         # middle
@@ -365,7 +284,7 @@ class VAEDecoder3d(nn.Module):
                     ],
                         dim=2)
                 x = layer(x, feat_cache[idx])
-                store_feat_cache(feat_cache, idx, cache_x)
+                feat_cache[idx] = cache_x
                 feat_idx[0] += 1
             else:
                 x = layer(x)

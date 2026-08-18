@@ -1,5 +1,4 @@
 from wan.modules.attention import attention
-from wan.modules.causal_rope import attach_causal_rope, rope_apply_original
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
@@ -28,10 +27,35 @@ from .action_module import ActionModule
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
-    """B0 path: FP64 complex loop. Prefer CausalRoPE.apply when attached."""
-    return rope_apply_original(
-        x, grid_sizes, freqs, start_frame=start_frame, real_dtype=torch.float64
-    )
+    n, c = x.size(2), x.size(3) // 2
+
+    # split freqs
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    # loop over samples
+    output = []
+    f, h, w = grid_sizes.tolist()
+
+    for i in range(len(x)):
+        seq_len = f * h * w
+
+        # precompute multipliers
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+            seq_len, n, -1, 2))
+        freqs_i = torch.cat([
+            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ],
+            dim=-1).reshape(seq_len, 1, -1)
+
+        # apply rotary embedding
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        # append to collection
+        output.append(x_i)
+    return torch.stack(output).type_as(x)
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -60,7 +84,6 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.causal_rope = None
 
     def forward(
         self,
@@ -128,17 +151,10 @@ class CausalWanSelfAttention(nn.Module):
             assert grid_sizes.ndim == 1
             frame_seqlen = math.prod(grid_sizes[1:]).item()
             current_start_frame = current_start // frame_seqlen
-            rope = getattr(self, "causal_rope", None)
-            if rope is None:
-                roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            else:
-                roped_query, roped_key = rope.apply_qk(
-                    q, k, grid_sizes, freqs, start_frame=current_start_frame)
-                roped_query = roped_query.type_as(v)
-                roped_key = roped_key.type_as(v)
+            roped_query = causal_rope_apply(
+                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            roped_key = causal_rope_apply(
+                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
                 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
@@ -269,18 +285,11 @@ class CausalWanAttentionBlock(nn.Module):
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        timer = getattr(self, "gemm_timer", None)
-
-        def _self_attn():
-            return self.self_attn(
-                (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
-                seq_lens, grid_sizes,
-                freqs, block_mask, kv_cache, current_start, cache_start)
-
-        if timer is not None:
-            y = timer.timed("attn", _self_attn)
-        else:
-            y = _self_attn()
+        
+        y = self.self_attn(
+            (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
+            seq_lens, grid_sizes,
+            freqs, block_mask, kv_cache, current_start, cache_start)
 
 
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -292,16 +301,10 @@ class CausalWanAttentionBlock(nn.Module):
                 assert mouse_cond is not None or keyboard_cond is not None
                 x = self.action_model(x.to(context.dtype), grid_sizes[0], grid_sizes[1], grid_sizes[2], mouse_cond, keyboard_cond, block_mask_mouse, block_mask_keyboard, is_causal=True, kv_cache_mouse=kv_cache_mouse, kv_cache_keyboard=kv_cache_keyboard, start_frame=start_frame, use_rope_keyboard=use_rope_keyboard, num_frame_per_block=num_frame_per_block)
             
-            def _ffn():
-                return self.ffn(
-                    (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
-                     frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
-                )
-
-            if timer is not None:
-                y = timer.timed("ffn", _ffn)
-            else:
-                y = _ffn()
+            y = self.ffn(
+                (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
+                 frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
+            )
             
             x = x + (y.unflatten(dim=1, sizes=(num_frames,
                      frame_seqlen)) * e[5]).flatten(1, 2)
@@ -473,7 +476,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         self.block_mask_mouse = None
         self.use_rope_keyboard = True
         self.num_frame_per_block = 1
-        attach_causal_rope(self, mode="fp64", profile=False, quiet=True)
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -663,14 +665,10 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        tich = getattr(self, "tich", None)
-        if tich is not None and tich.enabled:
-            x = tich.patch_embed(self, x, cond_concat)
-            context = tich.get_img_emb(self, visual_context)
-        else:
-            x = torch.cat([x, cond_concat], dim=1) # B C' F H W
-            x = self.patch_embedding(x)
-            context = self.img_emb(visual_context)
+        x = torch.cat([x, cond_concat], dim=1) # B C' F H W
+
+        # embeddings
+        x = self.patch_embedding(x)
         grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
         x = x.flatten(2).transpose(1, 2) # B FHW C'
         seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
@@ -682,6 +680,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
         # context
         context_lens = None
+        context = self.img_emb(visual_context)
         # arguments
         kwargs = dict(
             e=e0,

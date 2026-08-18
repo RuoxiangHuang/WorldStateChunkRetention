@@ -5,6 +5,8 @@
 **可以迁完整 KV-CR**，挂在 `CausalWanSelfAttention` 的 overflow 驱逐上。  
 默认 `--memory-policy window` = 官方 FIFO，行为不变。
 
+本目录只含这条记忆轴。不含 TICH / VAE Graph / FP8 FFN。
+
 ## 架构
 
 | | LingBot | Matrix-Game 2.0 |
@@ -24,7 +26,8 @@ attention 仍吃连续 `local_end - window : local_end`，不改 flash-attn。
 ## 怎么跑
 
 ```bash
-cd Matrix-Game-main/Matrix-Game-2
+cd matrix-game-2
+python wan/memory/test_kv_retention.py
 python inference.py \
     --config_path configs/inference_yaml/inference_universal.yaml \
     --checkpoint_path <ckpt> \
@@ -33,23 +36,7 @@ python inference.py \
     --cr-sink-frames 1 --cr-recent-frames 1
 ```
 
-TICH（默认关，与 CR 正交）：
-
-```bash
-python inference.py ... --enable-cond-hoist
-```
-
-CPU 单测（无需权重）：
-
-```bash
-python wan/memory/test_kv_retention.py
-python wan/memory/test_cond_hoist.py
-```
-
 ## 不要承诺的
 
 - 训练只看最近 6 帧，把更早的 sink/archive 塞回去是 OOD，回环可能变好也可能糊
 - 不会自动有 LingBot 同比例加速；窗口大小没变，变的是窗口里是谁
-- TICH 默认关；开 `--enable-cond-hoist` 只 hoist Conv3d 条件半边 + CLIP `img_emb`，不改 CR
-- 3 步蒸馏墙钟空间小，不要承诺 LingBot 同比例加速
-- TICH 状态绑在 pipeline/model 实例上（`TICHState`），不是进程全局缓存；`--cond-hoist-profile` 才打 CUDA event

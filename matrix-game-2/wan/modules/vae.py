@@ -7,8 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .vae_cache import store_feat_cache
-
 __all__ = [
     'WanVAE',
 ]
@@ -130,7 +128,7 @@ class Resample(nn.Module):
                         x = self.time_conv(x)
                     else:
                         x = self.time_conv(x, feat_cache[idx])
-                    store_feat_cache(feat_cache, idx, cache_x)
+                    feat_cache[idx] = cache_x
                     feat_idx[0] += 1
 
                     x = x.reshape(b, 2, c, t, h, w)
@@ -157,7 +155,7 @@ class Resample(nn.Module):
 
                     x = self.time_conv(
                         torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
-                    store_feat_cache(feat_cache, idx, cache_x)
+                    feat_cache[idx] = cache_x
                     feat_idx[0] += 1
         return x
 
@@ -215,7 +213,7 @@ class ResidualBlock(nn.Module):
                     ],
                         dim=2)
                 x = layer(x, feat_cache[idx])
-                store_feat_cache(feat_cache, idx, cache_x)
+                feat_cache[idx] = cache_x
                 feat_idx[0] += 1
             else:
                 x = layer(x)
@@ -329,7 +327,7 @@ class Encoder3d(nn.Module):
                 ],
                     dim=2)
             x = self.conv1(x, feat_cache[idx])
-            store_feat_cache(feat_cache, idx, cache_x)
+            feat_cache[idx] = cache_x
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
@@ -361,7 +359,7 @@ class Encoder3d(nn.Module):
                     ],
                         dim=2)
                 x = layer(x, feat_cache[idx])
-                store_feat_cache(feat_cache, idx, cache_x)
+                feat_cache[idx] = cache_x
                 feat_idx[0] += 1
             else:
                 x = layer(x)
@@ -435,7 +433,7 @@ class Decoder3d(nn.Module):
                 ],
                     dim=2)
             x = self.conv1(x, feat_cache[idx])
-            store_feat_cache(feat_cache, idx, cache_x)
+            feat_cache[idx] = cache_x
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
@@ -467,7 +465,7 @@ class Decoder3d(nn.Module):
                     ],
                         dim=2)
                 x = layer(x, feat_cache[idx])
-                store_feat_cache(feat_cache, idx, cache_x)
+                feat_cache[idx] = cache_x
                 feat_idx[0] += 1
             else:
                 x = layer(x)

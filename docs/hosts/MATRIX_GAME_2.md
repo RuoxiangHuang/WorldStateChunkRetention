@@ -12,6 +12,8 @@ Detail: [`matrix-game-2/docs/CR_TRANSFER.md`](../../matrix-game-2/docs/CR_TRANSF
 - `--memory-policy {window,world_state_cr}` (default `window` = official FIFO)
 - Action-module KV stays FIFO; selector checkpoints are **not** loaded
 
+This branch is **CR only**. TICH / VAE stream opts / FP8 FFN are not included.
+
 ## Run
 
 ```bash
