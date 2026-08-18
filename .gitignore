@@ -27,6 +27,10 @@ lingbot-world-Quant/
 third_party/WorldKV/
 third_party/WorldKV
 
+# Matrix-Game 2.0 WSCR host (zijun/mg2-wscr)
+matrix-game-2/outputs/
+matrix-game-2/assets/pdf/
+
 # ── Runtime outputs (regeneratable) ──
 output/
 lingbot-world/output/
