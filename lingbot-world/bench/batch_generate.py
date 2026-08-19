@@ -51,6 +51,7 @@ _BASE_MOCE = dict(local_attn_size=-1, sink_size=_SINK, **MA)
 _SWTP_KW = dict(enable_swtp=True, swtp_keep_ratio=0.5, swtp_num_summary=64,
                 swtp_min_saliency_gini=0.20, swtp_energy_cover=0.9,
                 archive_diversity_pool=4)
+_TICH_KW = dict(enable_cond_hoist=True)
 _CONSOL_EMA = dict(consolidation="ema", consol_beta=0.7, consol_patience=2,
                    consol_rank_alpha=0.0)
 _CONSOL_FULL = dict(consolidation="full", consol_beta=0.7, consol_patience=2,
@@ -59,9 +60,9 @@ _CONSOL_FULL = dict(consolidation="full", consol_beta=0.7, consol_patience=2,
 # World-State CR versions:
 #   v1 = attention-mass selector (frozen ablation)
 #   v2 = future-use selector only (former default)
-#   v3 = v2 + Memory Consolidation full + SWTP  ← default
+#   v3 = v2 + Memory Consolidation full + SWTP + TICH  ← default
 _WS_V2 = dict(**_BASE_MOCE, **_WS)
-_WS_V3 = dict(**_BASE_MOCE, **_WS, **_SWTP_KW, **_CONSOL_FULL)
+_WS_V3 = dict(**_BASE_MOCE, **_WS, **_SWTP_KW, **_CONSOL_FULL, **_TICH_KW)
 
 def _v3(**kw):
     d = dict(**_WS_V3)
@@ -138,7 +139,7 @@ def parse_args():
     ap.add_argument("--subset", default=None,
                     choices=sorted(_DEFAULT_SUBSETS),
                     help="Official RealCam-Vid default test subset "
-                         "(default_loop=24, default_random=40, default_all=64).")
+                         "(default_loop=60, default_random=40, default_all=100).")
     ap.add_argument("--out_dir", required=True, help="dir containing videos/ and stats/")
     ap.add_argument("--methods", default="window,world_state_cr")
     ap.add_argument("--frame_num", type=int, default=481)

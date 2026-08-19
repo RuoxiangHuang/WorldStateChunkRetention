@@ -1,6 +1,5 @@
 """Some of the functions are borrowed from SelfForcing (https://github.com/guandeh17/Self-Forcing)."""
 import math
-from einops import rearrange
 
 import torch
 import torch.distributed as dist
@@ -466,6 +465,10 @@ class CausalWanAttentionBlock(nn.Module):
         self.cam_scale_layer = nn.Linear(dim, dim)
         self.cam_shift_layer = nn.Linear(dim, dim)
 
+    def _cam_inject(self, x, dit_cond_dict, block_index: int = 0):
+        from .cond_hoist import block_cam_mod
+        return block_cam_mod(self, x, dit_cond_dict, block_index=block_index)
+
     def forward(
         self,
         x,
@@ -507,14 +510,8 @@ class CausalWanAttentionBlock(nn.Module):
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
-        # cam injection (only if dit_cond_dict is provided and contains c2ws_plucker_emb)
-        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-            c2ws_hidden_states = self.cam_injector_layer2(torch_F.silu(self.cam_injector_layer1(c2ws_plucker_emb)))
-            c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
-            cam_scale = self.cam_scale_layer(c2ws_hidden_states)
-            cam_shift = self.cam_shift_layer(c2ws_hidden_states)
-            x = (1.0 + cam_scale) * x + cam_shift
+        # Camera inject: elementwise always; Linear×4 may be hoisted (TICH).
+        x = self._cam_inject(x, dit_cond_dict, block_index=block_index)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
@@ -761,11 +758,25 @@ class WanModelFast(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # Patch embedding: optional exact Conv3d static/dynamic split (TICH).
+        from .cond_hoist import (
+            hoist_enabled, hoist_state, get_or_compute_global_cam,
+            ensure_block_cam_slots, patch_embed_split, conv3d_static_contribution,
+        )
+        use_conv_split = (
+            hoist_enabled()
+            and bool(hoist_state().get("conv_split"))
+            and y is not None
+        )
+        if use_conv_split:
+            st = hoist_state()
+            if st.get("conv_static") is None:
+                st["conv_static"] = conv3d_static_contribution(self, y)
+            x = patch_embed_split(self, x, y, static_list=st["conv_static"])
+        else:
+            if y is not None:
+                x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
@@ -794,26 +805,14 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 for u in context
             ]))
 
-        # cam
+        # cam — hoist global embedding (+ optional per-block scale/shift)
         if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-            c2ws_plucker_emb = [
-                rearrange(
-                    i,
-                    '1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)',
-                    c1=self.patch_size[0],
-                    c2=self.patch_size[1],
-                    c3=self.patch_size[2],
-                ) for i in c2ws_plucker_emb
-            ]
-            c2ws_plucker_emb = torch.cat(
-                c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
-            c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
-            c2ws_hidden_states = self.c2ws_hidden_states_layer2(
-                torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb)))
+            emb = get_or_compute_global_cam(self, dit_cond_dict)
             dit_cond_dict = dict(dit_cond_dict)
-            dit_cond_dict["c2ws_plucker_emb"] = (
-                c2ws_plucker_emb + c2ws_hidden_states)
+            dit_cond_dict["c2ws_plucker_emb"] = emb
+            dit_cond_dict["_cam_emb_ready"] = True
+            if hoist_enabled() and hoist_state().get("block_cam"):
+                ensure_block_cam_slots(len(self.blocks))
 
         # arguments
         kwargs = dict(

@@ -20,7 +20,7 @@ export WORLDKV_ROOT="${WORLDKV_ROOT:-/DATA/YuanZhen/Lingbot/third_party/WorldKV}
 # WorldKV detects control_type via 'cam' in path
 CKPT_CAM="${CKPT_CAM:-/DATA/YuanZhen/Lingbot/lingbot-world-base-cam}"
 
-# Default battery: all 64 clips (24 loop + 40 random); skip already-finished videos
+# Default battery: all 100 clips (60 loop + 40 random); skip already-finished videos
 SUBSET="${REALCAMVID_SUBSET:-default_all}"
 OUT="${REALCAMVID_OUT:-output/realcamvid_ws_vs_window_default_all_v2}"
 N="${N:-2}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Default RealCam-Vid battery: 64 clips (24 loop + 40 random), four CR methods + window.
+# Default RealCam-Vid battery: 100 clips (60 loop + 40 random), four CR methods + window.
 source "$(dirname "$0")/../../scripts/_common.sh"
 
 SUBSET="${REALCAMVID_SUBSET:-default_all}"

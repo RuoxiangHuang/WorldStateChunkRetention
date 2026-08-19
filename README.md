@@ -34,10 +34,11 @@ in-cache Memory Consolidation (EMA + L1/L2 demotion via SWTP).
 | Sliding Window | FIFO local attention baseline | `--memory_policy window` |
 | Heuristic CR | Motion-score archive ranking (ablation) | `--memory_policy heuristic_cr` |
 | Learned CR | 5-D ChunkSelector (`selector_all4.pt`) | `--memory_policy learned_cr` |
-| **World-State CR (v3)** | **Default**: future-use selector + consolidation + SWTP | `--memory_policy world_state_cr` |
+| **World-State CR (v3)** | **Default**: future-use selector + consolidation + SWTP + TICH | `--memory_policy world_state_cr` |
 | World-State CR v2 | Selector only (former default) | `--memory_policy world_state_cr_v2` |
 | World-State CR v1 | Attention-mass ablation (`selector_ws_v1.pt`) | `--memory_policy world_state_cr_v1` |
 | SWTP-only | Token pruning without CR | `--enable_swtp` (no CR policy) |
+| **TICH** | Timestep-invariant condition hoisting (exact compute-axis; on by default in WS-CR v3) | `--enable_cond_hoist` / `--disable_cond_hoist` |
 
 All CR variants are **post-generation** retention: generate a chunk → score
 history → keep a budgeted archive.
@@ -53,7 +54,7 @@ history → keep a budgeted archive.
 ├── CONTRIBUTING.md
 ├── env.sh                    ← paths: LINGBOT_WORLD, CKPT_DIR, WORLDKV_ROOT, …
 ├── docs/
-│   ├── method/               ← CHUNK_RETENTION / SWTP / MEMORY_CONSOLIDATION
+│   ├── method/               ← CHUNK_RETENTION / SWTP / MEMORY_CONSOLIDATION / TICH
 │   └── experiments/          ← RealCam-Vid protocol & notes
 ├── paper/                    ← ICLR paper LaTeX
 ├── lingbot-world/            ← ★ sole source (edit here)
@@ -184,6 +185,7 @@ python -m unittest discover -s tests -v
 | Chunk Retention (CR variants) | [`docs/method/CHUNK_RETENTION.md`](docs/method/CHUNK_RETENTION.md) |
 | SWTP | [`docs/method/SWTP.md`](docs/method/SWTP.md) |
 | Memory Consolidation | [`docs/method/MEMORY_CONSOLIDATION.md`](docs/method/MEMORY_CONSOLIDATION.md) |
+| TICH (condition hoisting) | [`docs/method/TICH_Condition_Hoisting.md`](docs/method/TICH_Condition_Hoisting.md) |
 | RealCam-Vid protocol | [`docs/experiments/REALCAMVID.md`](docs/experiments/REALCAMVID.md) |
 | Experiment index | [`docs/experiments/INDEX.md`](docs/experiments/INDEX.md) |
 | Weights layout | [`weights/README.md`](weights/README.md) |

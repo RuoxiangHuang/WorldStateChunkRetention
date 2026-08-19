@@ -39,6 +39,10 @@ from .utils.cam_utils import (
     get_Ks_transformed,
 )
 from einops import rearrange
+from .modules.cond_hoist import (
+    hoist_begin_chunk, hoist_end_chunk, hoist_reset_all, hoist_summary,
+    estimate_block_cam_cache_bytes,
+)
 
 
 class WanI2VFast:
@@ -88,6 +92,13 @@ class WanI2VFast:
         consol_gist_budget=512,
         consol_rank_alpha=0.5,
         consol_l2_bottom_ratio=0.5,
+        # Timestep-Invariant Condition Hoisting (exact, no approx)
+        enable_cond_hoist=False,
+        cond_hoist_global_cam=True,
+        cond_hoist_block_cam=True,
+        cond_hoist_conv_split=True,
+        cond_hoist_profile=False,
+        cond_hoist_verify=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -156,6 +167,12 @@ class WanI2VFast:
             swtp_num_summary=int(swtp_num_summary),
             swtp_energy_cover=float(swtp_energy_cover),
         )
+        self.enable_cond_hoist = bool(enable_cond_hoist)
+        self.cond_hoist_global_cam = bool(cond_hoist_global_cam)
+        self.cond_hoist_block_cam = bool(cond_hoist_block_cam)
+        self.cond_hoist_conv_split = bool(cond_hoist_conv_split)
+        self.cond_hoist_profile = bool(cond_hoist_profile)
+        self.cond_hoist_verify = bool(cond_hoist_verify)
 
         # ── Chunk selector (Learned / World-State CR) ───────────────────────
         # selector='learned' => ChunkSelector MLP archive ranking.
@@ -1145,10 +1162,31 @@ class WanI2VFast:
             "peak_memory_allocated_gb",
             "peak_memory_reserved_gb",
             "timesteps_index",
+            "cond_hoist_enabled",
+            "cond_hoist",
         ]
         for key in ordered_keys:
             if key in stats:
                 logging.info(f"  {key}: {self._format_stat_value(stats[key])}")
+        ch = stats.get("cond_hoist")
+        if isinstance(ch, dict) and ch.get("enabled"):
+            cnt = ch.get("counts") or {}
+            logging.info(
+                "[COND-HOIST] global reuse/compute=%s/%s block reuse/compute=%s/%s "
+                "conv_split/full=%s/%s",
+                cnt.get("global_reuse"), cnt.get("global_compute"),
+                cnt.get("block_reuse"), cnt.get("block_compute"),
+                cnt.get("conv_split"), cnt.get("conv_full"),
+            )
+            prof = ch.get("profile_ms") or {}
+            for k in ("global_cam", "block_linears", "elemwise",
+                      "conv_static", "conv_dynamic", "conv_full"):
+                p = prof.get(k) or {}
+                if p.get("n"):
+                    logging.info(
+                        "[COND-HOIST] profile[%s] n=%s mean_ms=%s",
+                        k, p.get("n"), p.get("mean_ms"),
+                    )
 
 
     def _debug_log_dynamic_kv_state(self, tag, kv_cache, chunk_id, extra=None):
@@ -1501,6 +1539,26 @@ class WanI2VFast:
                     kv_attention_limit = None
             else:
                 kv_attention_limit = kv_size if max_attention_size is None else max_attention_size
+            cond_hoist_on = bool(self.enable_cond_hoist)
+            hoist_reset_all()
+            if cond_hoist_on and self.rank == 0:
+                mem = estimate_block_cam_cache_bytes(
+                    num_layers=int(self.model.config.num_layers),
+                    tokens=int(frame_seqlen) * int(chunk_size),
+                    dim=int(getattr(self.model.config, "dim", 5120)),
+                    dtype_bytes=2,
+                )
+                logging.info(
+                    "[COND-HOIST] enabled global_cam=%s block_cam=%s "
+                    "conv_split=%s profile=%s verify=%s "
+                    "block_scale_shift_cache≈%.2f MB",
+                    bool(self.cond_hoist_global_cam),
+                    bool(self.cond_hoist_block_cam),
+                    bool(self.cond_hoist_conv_split),
+                    bool(self.cond_hoist_profile),
+                    bool(self.cond_hoist_verify),
+                    float(mem["mb_total"]),
+                )
             chunk_iter = range(num_inference_chunk)
             if self._cr_fast_runtime:
                 # CR: no tqdm (I/O + refresh overhead). Window keeps progress bar.
@@ -1513,6 +1571,16 @@ class WanI2VFast:
                 if (not self._cr_fast_runtime) and torch.cuda.is_available():
                     torch.cuda.synchronize(self.device)
                 chunk_start_time = time.perf_counter()
+                if cond_hoist_on:
+                    hoist_begin_chunk(
+                        chunk_id=int(chunk_id),
+                        enabled=True,
+                        global_cam=bool(self.cond_hoist_global_cam),
+                        block_cam=bool(self.cond_hoist_block_cam),
+                        conv_split=bool(self.cond_hoist_conv_split),
+                        profile=bool(self.cond_hoist_profile),
+                        verify=bool(self.cond_hoist_verify),
+                    )
                 current_latent = latents_chunk[chunk_id]
                 current_condition = condition_chunk[chunk_id]
                 current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
@@ -1674,6 +1742,8 @@ class WanI2VFast:
                             runtime_stats.setdefault("swtp_fallback_chunks", set()).add(chunk_id)
                 else:
                     self.model(x=[x0], t=timestep, **kwargs)
+                if cond_hoist_on:
+                    hoist_end_chunk()
                 if self.enable_motion_adaptive_kv_eviction:
                     self._debug_log_dynamic_kv_state(
                         tag="after_context_forward",
@@ -1805,6 +1875,13 @@ class WanI2VFast:
             "p95_chunk_time_s": (
                 float(sorted(chunk_times)[min(len(chunk_times) - 1, int(0.95 * (len(chunk_times) - 1)))])
                 if chunk_times else 0.0
+            ),
+            "cond_hoist_enabled": bool(cond_hoist_on),
+            "cond_hoist": (
+                hoist_summary(
+                    num_steps=len(list(getattr(self, "_last_timesteps_index", []) or [0, 1, 2, 3])),
+                )
+                if cond_hoist_on else None
             ),
             "consolidation": self.consolidation.mode,
             "revisit_coverage": runtime_stats.get("revisit_coverage"),

@@ -25,6 +25,8 @@ def _args(**kwargs):
         consol_l2_bottom_ratio=None,
         selector="learned",
         selector_ckpt=None,
+        enable_cond_hoist=False,
+        disable_cond_hoist=False,
     )
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -42,6 +44,7 @@ class TestMemoryPolicy(unittest.TestCase):
         _apply_memory_policy(a)
         self.assertFalse(a.enable_motion_adaptive_kv_eviction)
         self.assertEqual(a.selector, "heuristic")
+        self.assertFalse(a.enable_cond_hoist)
 
     def test_heuristic_cr(self):
         a = _args(memory_policy="heuristic_cr")
@@ -68,6 +71,12 @@ class TestMemoryPolicy(unittest.TestCase):
         self.assertEqual(a.consol_rank_alpha, 0.5)
         self.assertEqual(a.consol_gist_tokens, 64)
         self.assertEqual(a.consol_l2_bottom_ratio, 0.5)
+        self.assertTrue(a.enable_cond_hoist)
+
+    def test_world_state_cr_tich_can_be_disabled(self):
+        a = _args(memory_policy="world_state_cr", disable_cond_hoist=True)
+        _apply_memory_policy(a)
+        self.assertFalse(a.enable_cond_hoist)
 
     def test_world_state_cr_aliases_map_to_v3(self):
         for alias in ("world_state_cr_future", "world_state_cr_v3", "world_state_cr_consol"):
@@ -76,6 +85,7 @@ class TestMemoryPolicy(unittest.TestCase):
             self.assertEqual(a.memory_policy, "world_state_cr")
             self.assertEqual(a.consolidation, "full")
             self.assertTrue(a.enable_swtp)
+            self.assertTrue(a.enable_cond_hoist)
 
     def test_world_state_cr_v2_ablation(self):
         a = _args(memory_policy="world_state_cr_v2", selector="heuristic",
@@ -85,6 +95,7 @@ class TestMemoryPolicy(unittest.TestCase):
         self.assertTrue(a.selector_ckpt.endswith("selector_ws_future_v1.pt"))
         self.assertEqual(a.consolidation, "off")
         self.assertFalse(a.enable_swtp)
+        self.assertFalse(a.enable_cond_hoist)
 
     def test_world_state_cr_v1_ablation(self):
         a = _args(memory_policy="world_state_cr_v1", selector="heuristic")
@@ -134,6 +145,7 @@ class TestBatchGenerateMethodNames(unittest.TestCase):
         self.assertEqual(default.get("consol_rank_alpha"), 0.5)
         self.assertEqual(default.get("consol_gist_tokens"), 64)
         self.assertEqual(default.get("consol_l2_bottom_ratio"), 0.5)
+        self.assertTrue(default.get("enable_cond_hoist"))
         for alias in ("world_state_cr_v3", "world_state_cr_future",
                       "world_state_cr_consol", "ws_v3_a05_g64"):
             self.assertEqual(mod.METHODS[alias].get("consolidation"), "full")
@@ -144,6 +156,7 @@ class TestBatchGenerateMethodNames(unittest.TestCase):
         self.assertTrue(v2["selector_ckpt"].endswith("selector_ws_future_v1.pt"))
         self.assertNotIn("consolidation", v2)
         self.assertFalse(v2.get("enable_swtp", False))
+        self.assertFalse(v2.get("enable_cond_hoist", False))
         self.assertTrue(
             mod.METHODS["world_state_cr_v1"]["selector_ckpt"].endswith(
                 "selector_ws_v1.pt"))

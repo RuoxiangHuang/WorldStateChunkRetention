@@ -63,13 +63,19 @@ def _apply_ws_v2_selector(args):
 
 
 def _apply_ws_v3_consolidation(args):
-    """v3 package: SWTP + consolidation full.
+    """v3 package: SWTP + consolidation full + TICH.
 
     Default knobs match default_loop sweep winner ``ws_v3_a05_g64``:
     rank_alpha=0.5, gist_tokens=64, l2_bottom_ratio=0.5.
+    TICH is exact condition hoisting (orthogonal compute axis); opt out with
+    ``--disable_cond_hoist``.
     """
     args.enable_swtp = True
     args.consolidation = "full"
+    if not getattr(args, "disable_cond_hoist", False):
+        args.enable_cond_hoist = True
+    else:
+        args.enable_cond_hoist = False
     if int(getattr(args, "archive_diversity_pool", 0) or 0) <= 0:
         args.archive_diversity_pool = 4
     if getattr(args, "consol_rank_alpha", None) is None:
@@ -87,7 +93,7 @@ def _apply_memory_policy(args):
       window                 — sliding-window baseline (no MoCE)
       heuristic_cr           — motion-score archive ranking
       learned_cr             — 5-D ChunkSelector (selector_all4.pt)
-      world_state_cr         — default = v3 (v2 selector + consolidation full)
+      world_state_cr         — default = v3 (v2 selector + consolidation full + TICH)
       world_state_cr_v3      — alias of world_state_cr
       world_state_cr_consol  — alias of world_state_cr
       world_state_cr_future  — alias of world_state_cr (back-compat)
@@ -120,7 +126,7 @@ def _apply_memory_policy(args):
             args.selector_ckpt = resolve_selector_ckpt(
                 None, schema="learned")
     elif policy == "world_state_cr":
-        # Default v3: future-use v2 selector + Memory Consolidation + SWTP.
+        # Default v3: future-use v2 selector + Memory Consolidation + SWTP + TICH.
         _apply_ws_v2_selector(args)
         _apply_ws_v3_consolidation(args)
     elif policy == "world_state_cr_v2":
@@ -366,7 +372,7 @@ def _parse_args():
              "window=sliding baseline; heuristic_cr=motion archive; "
              "learned_cr=5-D ChunkSelector; "
              "world_state_cr=default v3 (future-use selector + consolidation "
-             "full + SWTP); "
+             "full + SWTP + TICH); "
              "world_state_cr_v3/consol/future=aliases of world_state_cr; "
              "world_state_cr_v2=frozen selector-only (former default); "
              "world_state_cr_v1=frozen attention-mass selector "
@@ -404,6 +410,36 @@ def _parse_args():
         type=float,
         default=0.08,
         help="Threshold of latent residual rescue signal for motion-adaptive KV eviction.")
+    parser.add_argument(
+        "--enable_cond_hoist", action="store_true", default=False,
+        help="Timestep-Invariant Condition Hoisting (TICH): exact elimination of "
+             "chunk-invariant camera/I2V condition compute inside the "
+             "denoising loop. Orthogonal to KV retention. No approx. "
+             "World-State CR v3 enables this automatically.")
+    parser.add_argument(
+        "--disable_cond_hoist", action="store_true", default=False,
+        help="Disable TICH even when --memory_policy world_state_cr would turn it on.")
+    parser.add_argument(
+        "--cond_hoist_global_cam",
+        type=lambda x: str(x).lower() not in ("0", "false", "no"),
+        default=True,
+        help="Cache global camera embedding per chunk (default True).")
+    parser.add_argument(
+        "--cond_hoist_block_cam",
+        type=lambda x: str(x).lower() not in ("0", "false", "no"),
+        default=True,
+        help="Cache per-block cam_scale/cam_shift (4 Linears) (default True).")
+    parser.add_argument(
+        "--cond_hoist_conv_split",
+        type=lambda x: str(x).lower() not in ("0", "false", "no"),
+        default=True,
+        help="I2V patch Conv3d static/dynamic split (default True).")
+    parser.add_argument(
+        "--cond_hoist_profile", action="store_true", default=False,
+        help="CUDA-event profile of hoistable vs residual kernels.")
+    parser.add_argument(
+        "--cond_hoist_verify", action="store_true", default=False,
+        help="Record max_abs diffs when comparing hoist paths (debug).")
     parser.add_argument(
         "--enable_swtp",
         action="store_true",
@@ -655,6 +691,12 @@ def generate(args):
         consol_gist_budget=getattr(args, "consol_gist_budget", 512),
         consol_rank_alpha=getattr(args, "consol_rank_alpha", 0.5),
         consol_l2_bottom_ratio=getattr(args, "consol_l2_bottom_ratio", 0.5),
+        enable_cond_hoist=bool(getattr(args, "enable_cond_hoist", False)),
+        cond_hoist_global_cam=bool(getattr(args, "cond_hoist_global_cam", True)),
+        cond_hoist_block_cam=bool(getattr(args, "cond_hoist_block_cam", True)),
+        cond_hoist_conv_split=bool(getattr(args, "cond_hoist_conv_split", True)),
+        cond_hoist_profile=bool(getattr(args, "cond_hoist_profile", False)),
+        cond_hoist_verify=bool(getattr(args, "cond_hoist_verify", False)),
     )
     logging.info("Generating video ...")
     video = wan_i2v.generate(

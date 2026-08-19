@@ -1,0 +1,21 @@
+# Revisit Memory Preference (pairwise)
+
+You compare two world-model methods on the SAME camera revisit.
+
+You are given FOUR images in order:
+1) Method A — FIRST-VISIT frame
+2) Method A — REVISIT frame
+3) Method B — FIRST-VISIT frame
+4) Method B — REVISIT frame
+
+Decide which method better preserves the **same physical place** from first-visit to revisit (layout / landmarks). Mild blur is less important than wrong room/layout.
+
+Choose `preference` as exactly one of: "A" | "B" | "tie"
+- "A" if Method A is clearly better
+- "B" if Method B is clearly better
+- "tie" if similar quality
+
+Write a 1-2 sentence `rationale` in English.
+
+Reply with ONLY a single JSON object (no markdown fences):
+{"preference": "A"|"B"|"tie", "rationale": "<text>"}

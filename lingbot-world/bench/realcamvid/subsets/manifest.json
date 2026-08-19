@@ -1,24 +1,27 @@
 {
-  "version": 1,
+  "version": 2,
   "source": "RealCam-Vid test split (converted clips in archive)",
   "archive_root": "artifacts/archive_pre_paper/bench/realcamvid",
   "subsets": {
     "default_loop": {
-      "description": "Revisit / loop-closure clips; primary eval for World-State CR",
-      "count": 24,
+      "description": "Revisit / loop-closure; primary WS-CR memory eval. Original 24 native indoor loops plus 36 ping-pong 481-frame extensions from clips_long (RE10K outdoor, DL3DV, MiraData).",
+      "count": 60,
+      "n_original_native_loop": 24,
+      "n_added_clips_long": 36,
       "clip_ids_file": "default_loop.txt",
-      "clips_dir": "clips_default_loop"
+      "clips_dir": "clips_default_loop",
+      "expansion": "default_loop_expansion.json"
     },
     "default_random": {
-      "description": "Stratified random forward tours (seed=42); generalization sanity check",
+      "description": "Stratified random forward tours (seed=42); generalization sanity check (mostly short, often no revisit)",
       "count": 40,
       "seed": 42,
       "clip_ids_file": "default_random.txt",
       "clips_dir": "clips_default_random"
     },
     "default_all": {
-      "description": "default_loop + default_random (recommended simple battery)",
-      "count": 64,
+      "description": "default_loop (60) + default_random (40); disjoint IDs",
+      "count": 100,
       "clip_ids_file": "default_all.txt",
       "clips_dir": "clips_default_all"
     }

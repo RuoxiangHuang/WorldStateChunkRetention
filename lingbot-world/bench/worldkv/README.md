@@ -8,7 +8,7 @@ Checkout: `third_party/WorldKV` → `/DATA/YuanZhen/WorldKV` (cvlab-kaist/WorldK
 source env.sh
 cd "$LINGBOT_WORLD"
 
-# default_loop (24 clips), write into existing comparison out dir
+# default_loop (60 clips), write into existing comparison out dir
 REALCAMVID_SUBSET=default_loop \
 REALCAMVID_OUT=output/realcamvid_ws_vs_window_default_all_v2 \
   bash bench/realcamvid/run_worldkv_official.sh

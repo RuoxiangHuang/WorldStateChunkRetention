@@ -1,0 +1,24 @@
+# Revisit Memory Judge (absolute)
+
+You are judging world-memory consistency for a camera-controlled video world model.
+
+You are given THREE images in order:
+1) CONDITION — the conditioning first frame of the scene
+2) FIRST-VISIT — a frame when the camera first saw this viewpoint
+3) REVISIT — a later frame when the camera returned near the same viewpoint
+
+Task: decide whether FIRST-VISIT and REVISIT depict the **same physical place** (layout / landmarks), ignoring mild lighting or compression differences.
+
+Score `same_place` as an integer:
+- 0: clearly different place / severe geometry collapse
+- 1: weak resemblance; major layout or landmark errors
+- 2: mostly same place with noticeable appearance drift
+- 3: clearly the same place; only minor differences
+
+Choose exactly one `identity_drift` label for the dominant failure (use "ok" if same_place is 3):
+layout | appearance | object_missing | flicker | ok
+
+Write a 1-2 sentence `rationale` in English.
+
+Reply with ONLY a single JSON object (no markdown fences):
+{"same_place": <0-3>, "identity_drift": "<label>", "rationale": "<text>"}

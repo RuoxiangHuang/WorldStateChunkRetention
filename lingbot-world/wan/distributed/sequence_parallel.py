@@ -300,11 +300,24 @@ def sp_dit_forward_causal(
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
 
-    if y is not None:
-        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-
-    # embeddings
-    x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+    from ..modules.cond_hoist import (
+        hoist_enabled, hoist_state, get_or_compute_global_cam,
+        ensure_block_cam_slots, patch_embed_split, conv3d_static_contribution,
+    )
+    use_conv_split = (
+        hoist_enabled()
+        and bool(hoist_state().get("conv_split"))
+        and y is not None
+    )
+    if use_conv_split:
+        st = hoist_state()
+        if st.get("conv_static") is None:
+            st["conv_static"] = conv3d_static_contribution(self, y)
+        x = patch_embed_split(self, x, y, static_list=st["conv_static"])
+    else:
+        if y is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
     grid_sizes = torch.stack(
         [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
     x = [u.flatten(2).transpose(1, 2) for u in x]
@@ -339,39 +352,37 @@ def sp_dit_forward_causal(
             for u in context
         ]))
 
-    # cam
+    # cam — hoist global emb; pad/chunk is cheap and still per-forward
     if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-        c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-        c2ws_plucker_emb = [
-            rearrange(
-                i,
-                '1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)',
-                c1=self.patch_size[0],
-                c2=self.patch_size[1],
-                c3=self.patch_size[2],
-            ) for i in c2ws_plucker_emb
-        ]
-        c2ws_plucker_emb = torch.cat(c2ws_plucker_emb,
-                                     dim=1)  # [1, (L1+...+Ln), C]
-        c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
-        c2ws_hidden_states = self.c2ws_hidden_states_layer2(
-            torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb)))
-        c2ws_plucker_emb = c2ws_plucker_emb + c2ws_hidden_states
+        st = hoist_state()
+        if (hoist_enabled() and st.get("global_cam")
+                and st.get("cam_emb_sp") is not None):
+            c2ws_plucker_emb = st["cam_emb_sp"]
+            st["n_global_reuse"] = int(st.get("n_global_reuse", 0)) + 1
+        else:
+            emb = get_or_compute_global_cam(self, dit_cond_dict)
+            c2ws_plucker_emb = emb
+            cam_len = c2ws_plucker_emb.size(1)
+            if cam_len < padded_seq_lens:
+                pad_len_cam = padded_seq_lens - cam_len
+                pad = c2ws_plucker_emb.new_zeros(
+                    c2ws_plucker_emb.size(0), pad_len_cam,
+                    c2ws_plucker_emb.size(2))
+                c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, pad], dim=1)
+            elif cam_len > padded_seq_lens:
+                c2ws_plucker_emb = c2ws_plucker_emb[:, :padded_seq_lens, :]
 
-        cam_len = c2ws_plucker_emb.size(1)
-        if cam_len < padded_seq_lens:
-            pad_len_cam = padded_seq_lens - cam_len
-            pad = c2ws_plucker_emb.new_zeros(
-                c2ws_plucker_emb.size(0), pad_len_cam, c2ws_plucker_emb.size(2))
-            c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, pad], dim=1)
-        elif cam_len > padded_seq_lens:
-            c2ws_plucker_emb = c2ws_plucker_emb[:, :padded_seq_lens, :]
+            if get_world_size() > 1:
+                c2ws_plucker_emb = torch.chunk(
+                    c2ws_plucker_emb, get_world_size(), dim=1)[get_rank()]
+            if hoist_enabled() and st.get("global_cam"):
+                st["cam_emb_sp"] = c2ws_plucker_emb
 
-        if get_world_size() > 1:
-            c2ws_plucker_emb = torch.chunk(
-                c2ws_plucker_emb, get_world_size(), dim=1)[get_rank()]
         dit_cond_dict = dict(dit_cond_dict)
         dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb
+        dit_cond_dict["_cam_emb_ready"] = True
+        if hoist_enabled() and st.get("block_cam"):
+            ensure_block_cam_slots(len(self.blocks))
 
     # Context Parallel
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]

@@ -44,11 +44,12 @@ clip_id/
 
 | 子集 | 条数 | 用途 |
 |------|------|------|
-| **`default_loop`** | 24 | 全部 loop  clip（回访主评测） |
-| **`default_random`** | 40 | seed=42 随机前向漫游（泛化 sanity） |
-| **`default_all`** | 64 | loop + random（**推荐默认电池**） |
+| **`default_loop`** | **60** | 回访主评测：同一批视频，481 帧 **multi_revisit** 日程（`clips_revisit/`，非 ping-pong） |
+| **`default_random`** | 40 | seed=42 随机前向漫游（泛化 sanity；多数无回访、轨迹较短） |
+| **`default_all`** | **100** | loop ∪ random（ID 不重叠） |
 
-清单文件：`default_loop.txt` / `default_random.txt` / `default_all.txt`；元数据见 `manifest.json`。
+清单文件：`default_loop.txt` / `default_random.txt` / `default_all.txt`；元数据见 `manifest.json`。  
+已发表的 v3 主表（PSNR / VLM）仍是 **原 24 条 native loop**；扩到 60 后需对新 36 条重新 generate+eval。
 
 生成 symlink 目录（一次性）：
 
